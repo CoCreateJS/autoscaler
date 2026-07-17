@@ -18,7 +18,8 @@
   "scripts": {
     "start": "npx webpack --config webpack.config.js",
     "build": "npx webpack --mode=production --config webpack.config.js",
-    "dev": "npx webpack --config webpack.config.js --watch"  },
+    "dev": "npx webpack --config webpack.config.js --watch"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/CoCreate-app/CoCreate-server-autoscaler.git"
