@@ -1,6 +1,6 @@
 {
   "name": "@cocreate/server-autoscaler",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A decentralized, cluster-consensus-driven autoscaling and telemetry-orchestration engine built specifically for CoCreate real-time transport servers.",
   "keywords": [
     "server-autoscaler",
