@@ -16,9 +16,9 @@
     "access": "public"
   },
   "scripts": {
-    "start": "npx webpack --config webpack.config.js",
-    "build": "npx webpack --mode=production --config webpack.config.js",
-    "dev": "npx webpack --config webpack.config.js --watch"
+    "start": "webpack --config webpack.config.js",
+    "build": "webpack --mode=production --config webpack.config.js",
+    "dev": "webpack --config webpack.config.js --watch"
   },
   "repository": {
     "type": "git",
