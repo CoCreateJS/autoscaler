@@ -1,3 +1,10 @@
+## [1.0.2](https://github.com/CoCreate-app/CoCreate-server-autoscaler/compare/v1.0.1...v1.0.2) (2026-07-19)
+
+
+### Bug Fixes
+
+* set default branch to main ([e07409f](https://github.com/CoCreate-app/CoCreate-server-autoscaler/commit/e07409f30538c1afcadb4a584a19ad077bda54bd))
+
 ## [1.0.1](https://github.com/CoCreate-app/CoCreate-server-autoscaler/compare/v1.0.0...v1.0.1) (2026-07-17)
 
 
