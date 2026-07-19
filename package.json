@@ -1,16 +1,19 @@
 {
   "name": "@cocreate/server-autoscaler",
   "version": "1.0.2",
-  "description": "A decentralized, cluster-consensus-driven autoscaling and telemetry-orchestration engine built specifically for CoCreate real-time transport servers.",
+  "description": "Decentralized, masterless P2P autoscaling engine for CoCreate Server. Executes autonomous horizontal and vertical multi-cloud adjustments driven by real-time tenant telemetry.",
   "keywords": [
-    "server-autoscaler",
-    "low-code",
-    "realtime",
-    "realtime-framework",
-    "collaboration",
-    "shared-editing",
-    "html5-framework",
-    "javascript-framework"
+    "cocreate",
+    "cocreate-server",
+    "autoscaler",
+    "cluster-orchestration",
+    "p2p-replication",
+    "decentralized-scaling",
+    "cloud-native",
+    "self-healing",
+    "cooperative-draining",
+    "multi-cloud-adapter",
+    "telemetry-driven"
   ],
   "publishConfig": {
     "access": "public"

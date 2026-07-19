@@ -1,91 +1,175 @@
-# CoCreate-url-uploader
+# CoCreate Server Autoscaler
 
-A simple url-uploader component in vanilla javascript. Easily configured using HTML5 data-attributes and/or JavaScript API. Take it for a spin in our [playground!](https://cocreate.app/docs/url-uploader)
+A decentralized, self-healing, and autonomous cluster lifecycle manager designed for high-performance multi-tenant ecosystems. Driven directly by real-time telemetry metrics, this module orchestrates vertical and horizontal scaling across top cloud providers using a peer-to-peer, masterless replication model.
 
-![min file size in bytes](https://img.badgesize.io/https://cdn.cocreate.app/url-uploader/latest/CoCreate-url-uploader.min.js?style=flat-square&label=minified&color=orange)
-![gzip file size in bytes](https://img.badgesize.io/https://cdn.cocreate.app/url-uploader/latest/CoCreate-url-uploader.min.js?compression=gzip&style=flat-square&label=gzip&color=yellow)
-![brotlifile size in bytes](https://img.badgesize.io/https://cdn.cocreate.app/url-uploader/latest/CoCreate-url-uploader.min.js?compression=brotli&style=flat-square&label=brotli)
-![GitHub latest release](https://img.shields.io/github/v/release/CoCreate-app/CoCreate-url-uploader?style=flat-square)
-![GitHub](https://img.shields.io/github/license/CoCreate-app/CoCreate-url-uploader?style=flat-square)
-![GitHub](https://img.shields.io/static/v1?style=flat-square&label=&message=Hiring&color=blueviolet)
+---
 
-![CoCreate-url-uploader](https://cdn.cocreate.app/docs/CoCreate-url-uploader.gif)
+## Documentation
 
-## [Docs & Demo](https://cocreate.app/docs/url-uploader)
+For advanced cloud provider configurations, identity IAM role policies, and threshold triggers, refer to the [CoCreate Server Autoscaler Documentation](https://cocreatejs.com/docs/server-autoscaler).
 
-For a complete guide and working demo refer to the [doumentation](https://cocreate.app/docs/url-uploader)
+## Table of Contents
 
-## CDN
+* [The Masterless Replicating Node Architecture](#the-masterless-replicating-node-architecture)
+* [Why CoCreate Server Autoscaler?](#why-cocreate-server-autoscaler)
+* [Vertical & Horizontal Multi-Cloud Adaptability](#vertical--horizontal-multi-cloud-adaptability)
+* [Self-Healing & Telemetry-Driven Lifecycle](#self-healing--telemetry-driven-lifecycle)
+* [Cooperative Draining & Scale-Down Sequence](#cooperative-draining--scale-down-sequence)
+* [Configuration](#configuration)
+* [Installation](#installation)
+* [Announcements](#announcements)
+* [Roadmap](#roadmap)
+* [How to Contribute](#how-to-contribute)
+* [About](#about)
 
-```html
-<script src="https://cdn.cocreate.app/url-uploader/latest/CoCreate-url-uploader.min.js"></script>
+---
+
+## The Masterless Replicating Node Architecture
+
+Traditional autoscaling relies on a centralized coordinator or a dedicated third-party master server (like a Kubernetes Control Plane or a custom Orchestrator VM) to monitor worker health and issue creation commands. If that master node crashes, the entire cluster's scaling capabilities freeze.
+
+`@cocreate/server-autoscaler` implements a **Decentralized, Peer-to-Peer (P2P) Replication Model**:
+
+* **Every Node is Both Master and Worker:** There are no specialized roles. Each node independently monitors its own resource limits, registers its state within the shared platform database, and monitors peer health via the `@cocreate/server-mesh` Control Plane.
+* **Autonomous Self-Replication:** If a node detects cluster-wide saturation or localized system boundaries, it doesn't wait for a central master to act. It directly contacts your cloud provider's API to clone its own VM image, dynamically spawning an exact sibling node to scale out immediately:
+
+$$\text{Resource Boundary Tripped} \implies \text{Node } A \xrightarrow{\text{Direct Cloud API Call}} \text{Clone VM Image} \implies \text{Spawn Sibling Node } B$$
+
+* **Zero Single Point of Failure (SPOF):** If any node drops offline or crashes, surviving peer nodes detect the loss of its keep-alive heartbeat on the mesh control plane and dynamically adjust scaling priorities.
+
+---
+
+## Why CoCreate Server Autoscaler?
+
+Unlike standard cloud-native autoscaling groups (like AWS ASGs) that only monitor generic hypervisor metrics like raw CPU and ignore application-level boundaries, `@cocreate/server-autoscaler` is tightly integrated with the CoCreate core.
+
+It understands **Multi-Tenant Boundaries** and **WebSocket Connection States**. It makes scaling decisions based on real-time transaction lag, active user session counts, and memory footprints rather than inaccurate system-level averages.
+
+---
+
+## Vertical & Horizontal Multi-Cloud Adaptability
+
+The autoscaler features a robust, pluggable **Cloud Adapter Plane** that supports standard vertical and horizontal orchestrations across all major cloud hosting platforms (AWS, Google Cloud, Azure, DigitalOcean, and Vultr).
+
+### 1. Horizontal Scaling (Scale In / Scale Out)
+
+* Spawns identical replica instances (cloned VM images or container instances) to distribute multi-tenant WebSocket connections across more physical servers.
+* Automatically registers new nodes with the `@cocreate/server-mesh` peer list upon boot.
+
+### 2. Vertical Scaling (Scale Up / Scale Down)
+
+* For cloud providers that support hot-swapping virtual resources, the autoscaler can programmatically upgrade instance tiers (increasing CPU/RAM limits) on-the-fly.
+* If a hot-swap is not supported, it performs a seamless rolling vertical upgrade: it spawns a larger tier node, drains the smaller node, and terminates the old instance.
+
+---
+
+## Self-Healing & Telemetry-Driven Lifecycle
+
+The autoscaler connects directly to the local `@cocreate/server-telemetry` Data Engine pipeline. It processes system telemetry metrics to continuously calculate a weighted saturation index:
+
+$$\text{Saturation Index} = \alpha \cdot \text{V8 CPU Lag} + \beta \cdot \text{RAM Utilization} + \gamma \cdot \text{Socket Density}$$
+
+* **Self-Healing Interventions:** If the Saturation Index exceeds your configured safety threshold for a sustained period, the autoscaler initiates scaling protocols.
+* **Dead-Node Pruning:** When a peer server drops offline without a clean exit (e.g., hardware failure or kernel panic), the active nodes wait for a stagger delay before pruning the dead node's records from the database registry and redistributing tenant routing channels.
+
+---
+
+## Cooperative Draining & Scale-Down Sequence
+
+To prevent cutting off active user sessions during a scale-down event, the autoscaler uses a secure, decoupled **Cooperative Draining** mechanism:
+
+```text
+       [Autoscaler Trigger]
+                │
+                ▼
+      [Cordon Target Node] ────► [HTTP Returns 307 Redirects] ────► [WebSocket Clients Migrated]
+                │
+                ▼
+     [Telemetry Zero Check] ───► [Flush Final Billing Data] ─────► [Clean VM Termination]
 ```
 
-```html
-<script src="https://cdn.cocreate.app/url-uploader/latest/CoCreate-url-uploader.min.css"></script>
+* **The Cordon Command:** The autoscaler flags the targeted node as `isCordon = true` via the secure control plane.
+* **Session Migration:** The target server's HTTP gateway begins returning `307 Temporary Redirect` responses. It calls `.destroyAll()` on the local `SocketServer` to safely disconnect users, forcing their browsers to reconnect to other online sibling nodes.
+* **Standby Verification:** The autoscaler monitors the target server's status in the database. Once the node reports `activeConnections: 0`, its buffers are fully flushed, and its database pools are closed, the autoscaler securely calls the cloud provider's API to destroy the instance.
+
+---
+
+## Configuration
+
+Place an `autoscaler.config.json` file in your server's root directory to declare your cloud provider credentials, scaling thresholds, and adapter settings.
+
+```json
+{
+  "provider": "aws",
+  "credentials": {
+    "region": "us-east-1",
+    "iamRole": "CoCreateAutoscalerRole"
+  },
+  "scaling": {
+    "minInstances": 2,
+    "maxInstances": 10,
+    "cooldownPeriodSeconds": 300,
+    "thresholds": {
+      "cpuUtilizationPercent": 80,
+      "memoryUtilizationPercent": 85,
+      "websocketConnectionsPerNode": 5000,
+      "v8LagLimitMs": 100
+    }
+  },
+  "replication": {
+    "imageId": "ami-cocreate-node-v1.6.1",
+    "instanceType": "t3.medium",
+    "securityGroup": "sg-cocreate-mesh-internal"
+  }
+}
 ```
 
-## NPM
+---
 
-```shell
-$ npm i @cocreate/url-uploader
+## Installation
+
+You can install this package locally via npm:
+
+```bash
+npm i @cocreate/server-autoscaler
 ```
 
-## yarn
+Or via yarn:
 
-```shell
-$ yarn install @cocreate/url-uploader
+```bash
+yarn add @cocreate/server-autoscaler
 ```
 
-# Table of Contents
+---
 
--   [Table of Contents](#table-of-contents)
--   [Announcements](#announcements)
--   [Roadmap](#roadmap)
--   [How to Contribute](#how-to-contribute)
--   [About](#about)
--   [License](#license)
+## Announcements
 
-<a name="announcements"></a>
+All scaling adaptations, cloud adapter API patches, and metric evaluation revisions are tracked inside our release logs on the [CoCreate Server Autoscaler GitHub Releases](https://github.com/CoCreate-app/CoCreate-server-autoscaler/releases) page. Please subscribe to our release notifications for breaking updates on cloud provider parameters.
 
-# Announcements
+---
 
-All updates to this library are documented in our [CHANGELOG](https://github.com/CoCreate-app/CoCreate-url-uploader/blob/master/CHANGELOG.md) and [releases](https://github.com/CoCreate-app/CoCreate-url-uploader/releases). You may also subscribe to email for releases and breaking changes.
+## Roadmap
 
-<a name="roadmap"></a>
+Upcoming enhancements planned for our autonomous scaling system include:
 
-# Roadmap
+* **Predictive Scaling Engine:** Utilizing linear regression models on historical time-series telemetry to preemptively scale up cluster capacity before scheduled traffic spikes.
+* **Kubernetes KEDA Adapter:** Native scaling support for containerized Kubernetes workloads using CoCreate telemetry events as custom HPA metrics.
 
-If you are interested in the future direction of this project, please take a look at our open [issues](https://github.com/CoCreate-app/CoCreate-url-uploader/issues) and [pull requests](https://github.com/CoCreate-app/CoCreate-url-uploader/pulls). We would love to hear your feedback.
+---
 
-<a name="about"></a>
+## How to Contribute
 
-# About
+We encourage contribution to our libraries (you might even score some nifty swag), please see our [CONTRIBUTING.md](https://github.com/CoCreate-app/CoCreate-server-autoscaler/blob/master/CONTRIBUTING.md) guide for details. If you encounter any bugs or wish to make feature requests, please submit an issue on our [GitHub Issues](https://github.com/CoCreate-app/CoCreate-server-autoscaler/issues) tracker. We want this library to be community-driven, and CoCreate led. We need your help to realize this goal.
 
-CoCreate-url-uploader is guided and supported by the CoCreate Developer Experience Team.
+For broader system configurations and API guides, please visit our [CoCreate Server Autoscaler Documentation](https://cocreatejs.com/docs/server-autoscaler).
 
-Please Email the Developer Experience Team [here](mailto:develop@cocreate.app) in case of any queries.
+---
 
-CoCreate-url-uploader is maintained and funded by CoCreate. The names and logos for CoCreate are trademarks of CoCreate, LLC.
+## About
 
-<a name="contribute"></a>
+`@cocreate/server-autoscaler` is designed, built, and supported by the CoCreate Developer Experience Team.
 
-# How to Contribute
+> [!NOTE]
+> Please contact the Developer Experience Team via [GitHub Discussions](https://github.com/CoCreate-app/CoCreate-server-autoscaler/discussions) or join our Discord channel for any architecture or deployment queries.
 
-We encourage contribution to our libraries (you might even score some nifty swag), please see our [CONTRIBUTING](https://github.com/CoCreate-app/CoCreate-url-uploader/blob/master/CONTRIBUTING.md) guide for details.
-
-We want this library to be community-driven, and CoCreate led. We need your help to realize this goal. To help make sure we are building the right things in the right order, we ask that you create [issues](https://github.com/CoCreate-app/CoCreate-url-uploader/issues) and [pull requests](https://github.com/CoCreate-app/CoCreate-url-uploader/pulls) or merely upvote or comment on existing issues or pull requests.
-
-We appreciate your continued support, thank you!
-
-<a name="license"></a>
-
-# License
-
-This software is dual-licensed under the GNU Affero General Public License version 3 (AGPLv3) and a commercial license.
-
--   **Open Source Use**: For open-source projects and non-commercial use, this software is available under the AGPLv3. The AGPLv3 allows you to freely use, modify, and distribute this software, provided that all modifications and derivative works are also licensed under the AGPLv3. For the full license text, see the [LICENSE file](https://github.com/CoCreate-app/CoCreate-url-uploader/blob/master/LICENSE).
-
--   **Commercial Use**: For-profit companies and individuals intending to use this software for commercial purposes must obtain a commercial license. The commercial license is available when you sign up for an API key on our [website](https://cocreate.app). This license permits proprietary use and modification of the software without the copyleft requirements of the AGPLv3. It is ideal for integrating this software into proprietary commercial products and applications.
-
-If you have not purchased a commercial license and intend to use this software for commercial purposes, you are required to sign up for an API key on our website.
+`@cocreate/server-autoscaler` is maintained and funded by CoCreate. The names and logos for CoCreate are trademarks of CoCreate, LLC.
