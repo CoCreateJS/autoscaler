@@ -443,9 +443,7 @@ export async function init(server) {
 
     serverCtx = server;
 
-    autoscaleConfig = await Config({
-        'autoscale': ''
-    });
+    autoscaleConfig = await Config.get('autoscale');
 
     const isEnabled = getValueFromObject(autoscaleConfig, 'autoscale.enabled') !== false && getValueFromObject(autoscaleConfig, 'autoscale.enabled') !== 'false';
 
