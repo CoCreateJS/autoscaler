@@ -473,7 +473,7 @@ export async function init(server) {
         }
     });
 
-    console.log('[@cocreate/server-autoscaler] Autoscaler initialized and subscribed to telemetry feed.');
+    console.log('[@cocreate/server-autoscaler] [PRIMARY] Autoscaler initialized and awaiting telemetry feed.');
 
     return {
         init,
