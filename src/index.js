@@ -19,7 +19,7 @@
 import cluster from 'node:cluster';
 import Config from '@cocreate/config';
 import { getValueFromObject } from '@cocreate/utils';
-import { calculateOptimalGeoLocation as getOptimalGeoLocation } from './geoScaling.js';
+import { getCloudProvider } from './geoScaling.js';
 
 // Guard clause verification to ensure cluster API abstraction integrity
 const isMaster = cluster.isMaster;
@@ -176,17 +176,7 @@ async function getClusterLatestFlushAverages() {
     }
 }
 
-/**
- * Aggregates client location distributions (timezones/regions) from telemetry and server metrics
- * to calculate the primary geographical target region for provisioning new edge nodes.
- * Delegated to dedicated GeoScaling module.
- * 
- * @param {Object} telemetry - Current telemetry payload frame
- * @returns {Object|null} Recommended geo target metadata or null if insufficient location data
- */
-function calculateOptimalGeoLocation(telemetry) {
-    return getOptimalGeoLocation(telemetry, autoscaleConfig, server);
-}
+
 
 /**
  * Validates whether scaling up is necessary by checking Node-level average first,
@@ -296,7 +286,12 @@ async function isClusterSafeToScaleDown(telemetry) {
 async function executeScaleAction(action, telemetry, meta = {}) {
     // If scaling up, calculate optimal edge geographic region based on active client density
     if (action === 'up') {
-        const geoTarget = calculateOptimalGeoLocation(telemetry);
+        const clients = Array.from(
+            server?.wsManager?.clients?.values() ?? [], 
+            client => client?.clientInfo
+        ).filter(Boolean);
+        
+        const geoTarget = getCloudProvider(clients, autoscaleConfig);    
         if (geoTarget) {
             meta.geo = geoTarget;
             console.log(`[@cocreate/server-autoscaler] Geo-Scaling active. Requesting provision in region: ${geoTarget.targetRegion}`);

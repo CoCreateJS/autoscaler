@@ -1,146 +1,205 @@
-import { findNearestCloudRegion, CLOUD_REGIONS } from './cloudRegions.js';
-import { getValueFromObject } from '@cocreate/utils';
+import { getValueFromObject, cloudProviders } from '@cocreate/utils';
 
 /**
- * Standard fallback coordinates for common region key identifiers
- */
-const KNOWN_REGION_COORDINATES = {
-    'us-east': { lat: 38.9489, lng: -77.4499 },
-    'us-west': { lat: 45.8399, lng: -119.7006 },
-    'eu-central': { lat: 50.1109, lng: 8.6821 },
-    'eu-west': { lat: 51.5074, lng: -0.1278 },
-    'ap-southeast': { lat: 1.3521, lng: 103.8198 },
-    'ap-northeast': { lat: 35.6762, lng: 139.6503 },
-    'sa-east': { lat: -23.5505, lng: -46.6333 },
-    'ap-south': { lat: 19.0760, lng: 72.8777 }
-};
-
-/**
- * Calculates weighted geographic centroid (lat/lng) from active client location telemetry.
+ * Calculates Great-Circle distance between two coordinates using Haversine formula (returns KM).
  * 
- * @param {Object} rawLocations - Map of regions or coordinates to active client counts
- * @returns {Object|null} Calculated centroid coordinates { lat, lng, totalWeight }
+ * @param {number} latitude1 - Starting latitude
+ * @param {number} longitude1 - Starting longitude
+ * @param {number} latitude2 - Ending latitude
+ * @param {number} longitude2 - Ending longitude
+ * @returns {number} Distance in kilometers
  */
-export function calculateWeightedCentroid(rawLocations) {
-    let totalWeight = 0;
-    let weightedLatSum = 0;
-    let weightedLngSum = 0;
+export function calculateHaversineDistance(latitude1, longitude1, latitude2, longitude2) {
+    const R = 6371; // Earth's radius in kilometers
+    const dLat = (latitude2 - latitude1) * Math.PI / 180;
+    const dLon = (longitude2 - longitude1) * Math.PI / 180;
+    const a = 
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(latitude1 * Math.PI / 180) * Math.cos(latitude2 * Math.PI / 180) *
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    
+    // Math.min safeguard prevents floating point NaN errors if a slightly exceeds 1.0
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - Math.min(1, a)));
+    return R * c;
+}
 
-    for (const [key, val] of Object.entries(rawLocations)) {
-        const count = typeof val === 'number' ? val : (val.count || val.total || val.clients || 1);
-        let coords = val.coords || val.coordinates;
+/**
+ * Finds the nearest cloud datacenter region across all providers (or an allowed subset)
+ * to a target latitude/longitude centroid.
+ * 
+ * @param {number} targetLatitude - Target Latitude centroid
+ * @param {number} targetLongitude - Target Longitude centroid
+ * @param {Object} [options] - Optional filters (e.g. preferred providers)
+ * @returns {Object|null} Recommended provider region metadata and distance in KM
+ */
+export function findNearestCloudRegion(targetLatitude, targetLongitude, options = {}) {
+    if (typeof targetLatitude !== 'number' || typeof targetLongitude !== 'number') {
+        return null;
+    }
 
-        // Attempt coordinate resolution via dictionary or Cloud Region Registry
-        if (!coords) {
-            const normalizedKey = key.toLowerCase();
-            if (KNOWN_REGION_COORDINATES[normalizedKey]) {
-                coords = KNOWN_REGION_COORDINATES[normalizedKey];
-            } else {
-                const regionMatch = CLOUD_REGIONS.find(
-                    r => r.region.toLowerCase() === normalizedKey || r.name.toLowerCase().includes(normalizedKey)
-                );
-                if (regionMatch) {
-                    coords = { lat: regionMatch.lat, lng: regionMatch.lng };
-                }
-            }
+    const allowedProviders = options.providers ? options.providers.map(p => String(p).toLowerCase()) : null;
+    let nearestMatch = null;
+    let minDistance = Infinity;
+
+    for (const loc of cloudProviders) {
+        if (allowedProviders && !allowedProviders.includes(loc.provider.toLowerCase())) {
+            continue;
         }
 
-        if (coords && typeof coords.lat === 'number' && typeof coords.lng === 'number') {
-            weightedLatSum += coords.lat * count;
-            weightedLngSum += coords.lng * count;
-            totalWeight += count;
+        const distance = calculateHaversineDistance(targetLatitude, targetLongitude, loc.lat, loc.lng);
+        if (distance < minDistance) {
+            minDistance = distance;
+            nearestMatch = {
+                provider: loc.provider,
+                region: loc.region,
+                datacenterName: loc.name,
+                countryCode: loc.country,
+                coordinates: { latitude: loc.lat, longitude: loc.lng },
+                distanceKm: Math.round(distance)
+            };
+        }
+    }
+
+    return nearestMatch;
+}
+
+/**
+ * Calculates weighted geographic centroid across location points using 3D spherical vector conversion.
+ * 
+ * @param {Array<Object>|Object} locations - Array of { latitude, longitude, count } or raw locations
+ * @returns {Object|null} Calculated centroid coordinates { latitude, longitude, totalWeight }
+ */
+export function calculateWeightedCentroid(clients) {
+    if (!clients || clients.length === 0) return null;
+
+    let totalWeight = 0;
+    let xSum = 0;
+    let ySum = 0;
+    let zSum = 0;
+
+    for (const loc of clients) {
+        if (loc && typeof loc.latitude === 'number' && typeof loc.longitude === 'number') {
+            const weight = typeof loc.count === 'number' ? loc.count : 1;
+            
+            // Convert Latitude and Longitude to Radians
+            const latRad = (loc.latitude * Math.PI) / 180;
+            const lngRad = (loc.longitude * Math.PI) / 180;
+
+            // Convert to 3D Cartesian coordinates on unit sphere
+            xSum += Math.cos(latRad) * Math.cos(lngRad) * weight;
+            ySum += Math.cos(latRad) * Math.sin(lngRad) * weight;
+            zSum += Math.sin(latRad) * weight;
+
+            totalWeight += weight;
         }
     }
 
     if (totalWeight === 0) return null;
 
+    // Weighted average 3D vector
+    const xAvg = xSum / totalWeight;
+    const yAvg = ySum / totalWeight;
+    const zAvg = zSum / totalWeight;
+
+    // Convert 3D Cartesian coordinates back to spherical Latitude and Longitude
+    const hyp = Math.sqrt(xAvg * xAvg + yAvg * yAvg);
+    const latitude = (Math.atan2(zAvg, hyp) * 180) / Math.PI;
+    const longitude = (Math.atan2(yAvg, xAvg) * 180) / Math.PI;
+
     return {
-        lat: weightedLatSum / totalWeight,
-        lng: weightedLngSum / totalWeight,
+        latitude,
+        longitude,
         totalWeight
     };
 }
 
 /**
- * Aggregates client location distributions across active telemetry and server metrics,
- * determines the primary client density cluster, and matches the optimal cloud datacenter region.
+ * Primary entry point: Calculates optimal cloud provider target and datacenter location.
+ * Enhanced with Multi-Node Anycast Shedding & Secondary Continent Threshold logic.
  * 
- * @param {Object} telemetry - Current telemetry payload frame
- * @param {Object} autoscaleConfig - Configuration object
- * @param {Object} server - Server master instance
- * @returns {Object|null} Recommended geo target metadata
+ * @param {Iterable|Array|Object} clients - Active client instances or location distribution map
+ * @param {Object} [options] - Configuration options
+ * @param {Array<Object>} [options.existingNodes] - Array of already active node regions (e.g. [{ continent: 'EU', region: 'eu-central-1' }])
+ * @param {number} [options.sheddingThreshold=0.40] - Secondary continent load percentage threshold (e.g. 0.40 for 40%)
+ * @returns {Object|null} Complete recommended target metadata
  */
-export function calculateOptimalGeoLocation(telemetry, autoscaleConfig, server) {
-    const isGeoScalingEnabled = getValueFromObject(autoscaleConfig, 'autoscale.geoScaling') !== false && 
-                                getValueFromObject(autoscaleConfig, 'autoscale.geoScaling') !== 'false';
+export function getCloudProvider(clients, options = {}) {
+    const preferredProviders = options.preferredProviders || 
+        (options.autoscaleConfig ? getValueFromObject(options.autoscaleConfig, 'autoscale.preferredProviders') : null);
 
-    if (!isGeoScalingEnabled) {
+    if (clients.length === 0) {
+        console.log("[@cocreate/server-autoscaler] [GEO-SCALING] No active client location data provided. Defaulting to provider default region.");
         return null;
     }
 
-    // Extract aggregated client locations from telemetry payload or server state
-    const rawLocations = telemetry?.clientLocations || 
-                         telemetry?.locationAverages || 
-                         server?.clientLocations || 
-                         server?.clientAverageLocations || {};
+    const totalActiveClients = clients.reduce((sum, item) => sum + item.count, 0);
 
-    const entries = Object.entries(rawLocations);
-    if (entries.length === 0) {
-        console.log("[@cocreate/server-autoscaler] [GEO-SCALING] No client location data reported. Defaulting to provider default region.");
-        return null;
-    }
-
-    let totalClients = 0;
-    let dominantRegion = null;
-    let maxCount = -1;
-
-    // Tally client counts per region/timezone to identify the primary target cluster
-    for (const [region, count] of entries) {
-        const clientCount = typeof count === 'number' ? count : (count.total || count.clients || 0);
-        totalClients += clientCount;
-
-        if (clientCount > maxCount) {
-            maxCount = clientCount;
-            dominantRegion = region;
+    // 1. Group active client locations into continent macro-regions (EU, NA, AS, SA, OC, AF, ME)
+    const continentBreakdown = {};
+    for (const client of clients) {
+        const continent = client.continent || 'UNKNOWN';
+        if (!continentBreakdown[continent]) {
+            continentBreakdown[continent] = { count: 0, locations: [] };
         }
+        continentBreakdown[continent].count += client.count;
+        continentBreakdown[continent].locations.push(client);
     }
 
-    if (!dominantRegion || totalClients === 0) {
-        return null;
+    // Sort continents by active client load descending
+    const sortedContinents = Object.keys(continentBreakdown)
+        .sort((a, b) => continentBreakdown[b].count - continentBreakdown[a].count);
+
+    const dominantContinent = sortedContinents[0];
+    const maxContinentCount = continentBreakdown[dominantContinent].count;
+    const dominantPercentage = parseFloat(((maxContinentCount / totalActiveClients) * 100).toFixed(1));
+
+    const secondaryContinent = sortedContinents[1] || null;
+    const secondaryCount = secondaryContinent ? continentBreakdown[secondaryContinent].count : 0;
+    const secondaryPercentage = secondaryContinent ? parseFloat(((secondaryCount / totalActiveClients) * 100).toFixed(1)) : 0;
+
+    // 2. Evaluate Multi-Node Shedding Logic against existing nodes
+    const existingNodes = options.existingNodes || [];
+    const sheddingThresholdPct = options.sheddingThreshold ?? 40.0; // Default 40% threshold
+
+    const hasNodeInDominantContinent = existingNodes.some(node => node.continent === dominantContinent);
+
+    let targetContinent = dominantContinent;
+    let isSheddingTarget = false;
+
+    if (hasNodeInDominantContinent && secondaryContinent && secondaryPercentage >= sheddingThresholdPct) {
+        // A node already exists in the primary continent, and a secondary continent meets the shedding threshold!
+        targetContinent = secondaryContinent;
+        isSheddingTarget = true;
+        console.log(`[@cocreate/server-autoscaler] [GEO-SCALING] [SHEDDING TRIGGERED] Node already active in primary region [${dominantContinent}]. Secondary region [${secondaryContinent}] load (${secondaryPercentage}%) >= threshold (${sheddingThresholdPct}%). Targeting [${secondaryContinent}] for Anycast offloading.`);
     }
 
-    const densityPercentage = ((maxCount / totalClients) * 100).toFixed(1);
+    // 3. Calculate Centroid & Target Cloud Datacenter for target region
+    const targetLocations = continentBreakdown[targetContinent].locations;
+    const regionalCentroid = calculateWeightedCentroid(targetLocations);
+    const globalCentroid = calculateWeightedCentroid(clientLocations);
 
-    // Calculate geographic centroid and lookup nearest cloud datacenter
-    const centroid = calculateWeightedCentroid(rawLocations);
     let nearestCloud = null;
-
-    if (centroid) {
-        const preferredProviders = getValueFromObject(autoscaleConfig, 'autoscale.preferredProviders');
-        nearestCloud = findNearestCloudRegion(centroid.lat, centroid.lng, {
+    if (regionalCentroid) {
+        nearestCloud = findNearestCloudRegion(regionalCentroid.latitude, regionalCentroid.longitude, {
             providers: Array.isArray(preferredProviders) ? preferredProviders : null
         });
     }
 
-    console.log(`[@cocreate/server-autoscaler] [GEO-SCALING] Primary client density cluster identified: ${dominantRegion} (${maxCount}/${totalClients} clients, ${densityPercentage}% of load).`);
-
-    if (nearestCloud) {
-        console.log(`[@cocreate/server-autoscaler] [GEO-SCALING] Nearest optimal cloud datacenter matched: ${nearestCloud.provider.toUpperCase()} ${nearestCloud.region} (${nearestCloud.datacenterName}, ${nearestCloud.distanceKm} km away).`);
-    }
-
     return {
-        targetRegion: dominantRegion,
-        densityPercentage: parseFloat(densityPercentage),
-        primaryClientCount: maxCount,
-        totalActiveClients: totalClients,
-        locationBreakdown: rawLocations,
-        centroid,
+        dominantContinent,
+        dominantPercentage,
+        secondaryContinent,
+        secondaryPercentage,
+        targetContinent,
+        isSheddingTarget,
+        continentBreakdown,
+        regionalCentroid,
+        globalCentroid,
         nearestCloudRegion: nearestCloud,
+        totalActiveClients,
+        clientLocations,
         timestamp: Date.now()
     };
 }
 
-export default {
-    calculateWeightedCentroid,
-    calculateOptimalGeoLocation
-};
+export default getCloudProvider;
