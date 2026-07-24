@@ -19,7 +19,7 @@
 import cluster from 'node:cluster';
 import Config from '@cocreate/config';
 import { getValueFromObject } from '@cocreate/utils';
-import { calculateOptimalGeoLocation as getOptimalGeoLocation } from './geoscaling.js';
+import { calculateOptimalGeoLocation as getOptimalGeoLocation } from './geoScaling.js';
 
 // Guard clause verification to ensure cluster API abstraction integrity
 const isMaster = cluster.isMaster;
