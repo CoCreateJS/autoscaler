@@ -23,12 +23,12 @@ import Config from '@cocreate/config';
 import { getValueFromObject } from '@cocreate/utils';
 
 // Guard clause verification to ensure cluster API abstraction integrity
-const isPrimary = cluster.isPrimary !== undefined ? cluster.isPrimary : cluster.isMaster;
+const isMaster = cluster.isMaster;
 
 // ==============================================================================
 // Module-Level Sandbox State (ESM Singleton Container)
 // ==============================================================================
-let serverCtx = null;             // Central reference to CoCreateServer Primary instance
+let server = null;                // Central reference to CoCreateServer Master instance
 let autoscaleConfig = null;       // Configured thresholds and duration constants
 let isRunning = false;            // Execution loop flag
 
@@ -130,7 +130,7 @@ async function executeScaleAction(direction, metrics, actionConfig = {}) {
     const payload = {
         method: actionConfig.method || 'infrastructure.scale',
         timestamp: new Date().toISOString(),
-        serverId: serverCtx?.id || 'simulated-server-id',
+        serverId: server?.id || 'simulated-server-id',
         direction: direction,
         provider: actionConfig.provider || 'round-robin',
         spec: actionConfig.spec || 'standard',
@@ -144,14 +144,14 @@ async function executeScaleAction(direction, metrics, actionConfig = {}) {
     };
 
     // 1. Broadcast scaling details locally and over the P2P Server Mesh
-    if (serverCtx && typeof serverCtx.send === 'function') {
-        serverCtx.send({
+    if (server && typeof server.send === 'function') {
+        server.send({
             method: 'infrastructure.scale',
             broadcast: true,
             payload: payload
         });
 
-        serverCtx.send({
+        server.send({
             method: 'metric.scaleAlert',
             broadcast: true,
             direction,
@@ -240,7 +240,7 @@ export function calculateDynamicSafetyThreshold() {
  * @returns {boolean} Verified consensus state allowing scale-down
  */
 async function isClusterSafeToScaleDown() {
-    if (!serverCtx?.crud) {
+    if (!server?.crud) {
         console.warn("[@cocreate/server-autoscaler] Database access layer is unavailable. Scaling down rejected.");
         return false;
     }
@@ -248,15 +248,15 @@ async function isClusterSafeToScaleDown() {
     const minSize = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.minClusterSize'), 10) || defaults.minClusterSize;
 
     try {
-        const readResponse = await serverCtx.crud.send({
+        const readResponse = await server.crud.send({
             method: 'object.read',
             array: 'servers',
             $filter: {
                 query: { status: 'active' },
                 limit: 0
             },
-            organization_id: serverCtx.organization_id,
-            host: serverCtx.host
+            organization_id: server.organization_id,
+            host: server.host
         });
 
         const activeServers = normalizePeersList(readResponse);
@@ -433,69 +433,56 @@ async function processMetricFlush(metricPayload) {
 /**
  * Boots the autoscaler system exclusively on the Master/Primary process context.
  * 
- * @param {Object} server - Central CoCreateServer instance references
+ * @param {Object} serverInstance - Central CoCreateServer instance references
  * @returns {Object} Active autoscale control API
  */
-export async function init(server) {
-    if (!isPrimary) {
-        throw new Error("[@cocreate/server-autoscaler] [FATAL] Violation of scope: ServerAutoscaler can only run on the Primary (Master) process.");
+export async function init(serverInstance) {
+    server = serverInstance;
+    
+    if (!isMaster) {
+        console.log('[@cocreate/server-autoscaler] Autoscaler initialized on worker node (Standby).');
+        return;
     }
 
-    serverCtx = server;
-
-    autoscaleConfig = await Config.get('autoscale');
+    try {
+        autoscaleConfig = await Config.get('autoscale');
+    } catch (e) {
+        console.warn('[@cocreate/server-autoscaler] Failed to load config, falling back to defaults.', e.message);
+        autoscaleConfig = {};
+    }
 
     const isEnabled = getValueFromObject(autoscaleConfig, 'autoscale.enabled') !== false && getValueFromObject(autoscaleConfig, 'autoscale.enabled') !== 'false';
 
     if (!isEnabled) {
-        console.log('[@cocreate/server-autoscaler] ServerAutoscaler is disabled by configuration.');
-        return { init, stop };
+        console.log('[@cocreate/server-autoscaler] Autoscaling is disabled by configuration.');
+        return;
     }
 
     isRunning = true;
-    
-    consecutiveCpuSpikes = 0;
-    consecutiveLowLoadTicks = 0;
 
-    serverCtx.on('metric', (payload) => {
-        if (payload && payload.data) {
-            processMetricFlush(payload.data).catch(err => {
-                console.error("[@cocreate/server-autoscaler] Error processing autoscale execution tick:", err);
-            });
-        }
+    // Subscribe to telemetry metric dispatches published by server-telemetry.js
+    server.on('telemetry', (payload) => {
+        processMetricFlush(payload);
     });
 
-    serverCtx.on('metric.emergency', (payload) => {
-        if (payload && payload.data) {
-            processEmergencyAlert(payload.data).catch(err => {
-                console.error("[@cocreate/server-autoscaler] Error processing emergency autoscale trigger:", err);
-            });
-        }
+    // Subscribe to rapid immediate scaling alarms published by the emergency 1s loop
+    server.on('telemetry.emergency', (payload) => {
+        processEmergencyAlert(payload);
     });
 
-    console.log('[@cocreate/server-autoscaler] [PRIMARY] Autoscaler initialized and awaiting telemetry feed.');
-
-    return {
-        init,
-        stop,
-        processMetricFlush,
-        processEmergencyAlert,
-        executeScaleAction,
-        calculateDynamicSafetyThreshold
-    };
+    console.log('[@cocreate/server-autoscaler] Initialized and listening for telemetry metrics on Master node.');
 }
 
 /**
- * Terminates monitoring sweeps and unsubscribes from the process emitter.
+ * Halts any active autoscaler processing
  */
 export function stop() {
     isRunning = false;
-    consecutiveCpuSpikes = 0;
-    consecutiveLowLoadTicks = 0;
-    console.log('[@cocreate/server-autoscaler] ServerAutoscaler monitoring stopped.');
+    console.log('[@cocreate/server-autoscaler] Execution loop halted.');
 }
 
-export default {
-    init,
-    stop
+export default { 
+    init, 
+    stop, 
+    calculateDynamicSafetyThreshold 
 };
