@@ -66,7 +66,7 @@ export function findNearestCloudRegion(targetLatitude, targetLongitude, options 
 /**
  * Calculates weighted geographic centroid across location points using 3D spherical vector conversion.
  * 
- * @param {Array<Object>|Object} locations - Array of { latitude, longitude, count } or raw locations
+ * @param {Array<Object>} clients - Array of { latitude, longitude, count }
  * @returns {Object|null} Calculated centroid coordinates { latitude, longitude, totalWeight }
  */
 export function calculateWeightedCentroid(clients) {
@@ -115,89 +115,107 @@ export function calculateWeightedCentroid(clients) {
 
 /**
  * Primary entry point: Calculates optimal cloud provider target and datacenter location.
- * Enhanced with Multi-Node Anycast Shedding & Secondary Continent Threshold logic.
+ * Implements optional continent-based load shedding and fallback behavior.
  * 
- * @param {Iterable|Array|Object} clients - Active client instances or location distribution map
+ * @param {Array<Object>} clients - Active client instances or location distribution map
  * @param {Object} [options] - Configuration options
- * @param {Array<Object>} [options.existingNodes] - Array of already active node regions (e.g. [{ continent: 'EU', region: 'eu-central-1' }])
- * @param {number} [options.sheddingThreshold=0.40] - Secondary continent load percentage threshold (e.g. 0.40 for 40%)
+ * @param {boolean} [options.geoScaleByContinent=false] - If true, isolates centroid calculation to specific continent thresholds
+ * @param {Array<Object>} [options.existingNodes] - Array of already active node regions (e.g. [{ continent: 'EU' }])
+ * @param {number} [options.sheddingThreshold=0] - Required traffic percentage in an unserved region to trigger shedding (e.g. 20 for 20%)
  * @returns {Object|null} Complete recommended target metadata
  */
 export function getCloudProvider(clients, options = {}) {
-    const preferredProviders = options.preferredProviders || 
-        (options.autoscaleConfig ? getValueFromObject(options.autoscaleConfig, 'autoscale.preferredProviders') : null);
-
-    if (clients.length === 0) {
+    if (!clients || clients.length === 0) {
         console.log("[@cocreate/server-autoscaler] [GEO-SCALING] No active client location data provided. Defaulting to provider default region.");
         return null;
     }
 
-    const totalActiveClients = clients.reduce((sum, item) => sum + item.count, 0);
+    const preferredProviders = options.preferredProviders || 
+        (options.autoscaleConfig ? getValueFromObject(options.autoscaleConfig, 'autoscale.preferredProviders') : null);
 
-    // 1. Group active client locations into continent macro-regions (EU, NA, AS, SA, OC, AF, ME)
-    const continentBreakdown = {};
+    const totalActiveClients = clients.reduce((sum, item) => sum + (item.count || 1), 0);
+
+    // 1. GLOBAL SCALING MODE (Default behavior if continent scaling is disabled)
+    if (!options.geoScaleByContinent) {
+        const globalCentroid = calculateWeightedCentroid(clients);
+        const nearestCloud = globalCentroid ? findNearestCloudRegion(globalCentroid.latitude, globalCentroid.longitude, {
+            providers: preferredProviders
+        }) : null;
+
+        return {
+            geoScaleByContinent: false,
+            targetCentroid: globalCentroid,
+            nearestCloudRegion: nearestCloud,
+            totalActiveClients,
+            timestamp: Date.now()
+        };
+    }
+
+    // 2. CONTINENT-BASED SCALING MODE
+    const continentMap = {};
+
+    // Group clients and aggregate weights per continent
     for (const client of clients) {
         const continent = client.continent || 'UNKNOWN';
-        if (!continentBreakdown[continent]) {
-            continentBreakdown[continent] = { count: 0, locations: [] };
+        if (!continentMap[continent]) {
+            continentMap[continent] = { continent, weight: 0, clients: [] };
         }
-        continentBreakdown[continent].count += client.count;
-        continentBreakdown[continent].locations.push(client);
+        continentMap[continent].weight += (client.count || 1);
+        continentMap[continent].clients.push(client);
     }
 
-    // Sort continents by active client load descending
-    const sortedContinents = Object.keys(continentBreakdown)
-        .sort((a, b) => continentBreakdown[b].count - continentBreakdown[a].count);
+    // Convert map to array and order by weight (highest traffic first)
+    const orderedContinents = Object.values(continentMap).sort((a, b) => b.weight - a.weight);
 
-    const dominantContinent = sortedContinents[0];
-    const maxContinentCount = continentBreakdown[dominantContinent].count;
-    const dominantPercentage = parseFloat(((maxContinentCount / totalActiveClients) * 100).toFixed(1));
-
-    const secondaryContinent = sortedContinents[1] || null;
-    const secondaryCount = secondaryContinent ? continentBreakdown[secondaryContinent].count : 0;
-    const secondaryPercentage = secondaryContinent ? parseFloat(((secondaryCount / totalActiveClients) * 100).toFixed(1)) : 0;
-
-    // 2. Evaluate Multi-Node Shedding Logic against existing nodes
     const existingNodes = options.existingNodes || [];
-    const sheddingThresholdPct = options.sheddingThreshold ?? 40.0; // Default 40% threshold
+    const activeContinents = existingNodes.map(node => node.continent);
+    const sheddingThresholdPct = options.sheddingThreshold || 0; // Default to 0% (any traffic triggers shedding)
 
-    const hasNodeInDominantContinent = existingNodes.some(node => node.continent === dominantContinent);
-
-    let targetContinent = dominantContinent;
+    let targetContinentData = null;
     let isSheddingTarget = false;
 
-    if (hasNodeInDominantContinent && secondaryContinent && secondaryPercentage >= sheddingThresholdPct) {
-        // A node already exists in the primary continent, and a secondary continent meets the shedding threshold!
-        targetContinent = secondaryContinent;
-        isSheddingTarget = true;
-        console.log(`[@cocreate/server-autoscaler] [GEO-SCALING] [SHEDDING TRIGGERED] Node already active in primary region [${dominantContinent}]. Secondary region [${secondaryContinent}] load (${secondaryPercentage}%) >= threshold (${sheddingThresholdPct}%). Targeting [${secondaryContinent}] for Anycast offloading.`);
+    // Find the first continent that DOES NOT have a server but MEETS the shedding threshold
+    for (const cont of orderedContinents) {
+        const percentage = (cont.weight / totalActiveClients) * 100;
+        const hasServer = activeContinents.includes(cont.continent);
+
+        if (!hasServer && percentage >= sheddingThresholdPct) {
+            targetContinentData = cont;
+            isSheddingTarget = true;
+            console.log(`[@cocreate/server-autoscaler] [GEO-SCALING] [SHEDDING TRIGGERED] Targeting new continent [${cont.continent}] representing ${percentage.toFixed(1)}% of total load.`);
+            break;
+        }
     }
 
-    // 3. Calculate Centroid & Target Cloud Datacenter for target region
-    const targetLocations = continentBreakdown[targetContinent].locations;
-    const regionalCentroid = calculateWeightedCentroid(targetLocations);
-    const globalCentroid = calculateWeightedCentroid(clientLocations);
+    // Fallback: If all regions already have servers or thresholds aren't met,
+    // fallback to the continent with the absolute highest weight (the first item).
+    if (!targetContinentData) {
+        targetContinentData = orderedContinents[0];
+    }
 
+    // Calculate centroid strictly using the clients from the targeted continent
+    const regionalCentroid = calculateWeightedCentroid(targetContinentData.clients);
     let nearestCloud = null;
+
     if (regionalCentroid) {
         nearestCloud = findNearestCloudRegion(regionalCentroid.latitude, regionalCentroid.longitude, {
-            providers: Array.isArray(preferredProviders) ? preferredProviders : null
+            providers: preferredProviders
         });
     }
 
     return {
-        dominantContinent,
-        dominantPercentage,
-        secondaryContinent,
-        secondaryPercentage,
-        targetContinent,
+        geoScaleByContinent: true,
+        targetContinent: targetContinentData.continent,
         isSheddingTarget,
-        continentBreakdown,
-        regionalCentroid,
-        globalCentroid,
+        targetPercentage: parseFloat(((targetContinentData.weight / totalActiveClients) * 100).toFixed(1)),
+        orderedContinents: orderedContinents.map(c => ({
+            continent: c.continent,
+            weight: c.weight,
+            percentage: parseFloat(((c.weight / totalActiveClients) * 100).toFixed(1))
+        })),
+        targetCentroid: regionalCentroid,
         nearestCloudRegion: nearestCloud,
         totalActiveClients,
-        clientLocations,
         timestamp: Date.now()
     };
 }

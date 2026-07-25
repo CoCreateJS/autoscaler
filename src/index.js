@@ -34,109 +34,64 @@ let consecutiveLowLoadFlushes = 0;
 
 // Default operational values for telemetry-driven autoscale thresholds
 const defaults = {
-    scaleUpCpuThreshold: 95,             // CPU usage percentage trigger for Scaling Up (Sustained over flushes)
-    scaleDownCpuThreshold: 60,           // CPU usage percentage trigger for Scaling Down (Sustained over flushes)
-    scaleUpMemoryThreshold: 85,          // Heap memory utilization trigger for Scaling Up (Instant Per Tick)
-    scaleDownMemoryThreshold: 60,        // Heap memory utilization trigger for Scaling Down (Sustained over flushes)
-    consecutiveCpuSpikesRequired: 3,     // Require 3 consecutive flushes of high CPU (e.g. 3 flush windows)
-    consecutiveLowFlushesRequired: 10,   // Require 10 consecutive flushes of low load (~10-minute debounced check window)
-    minClusterSize: 2,                   // Minimum cluster floor
-    /**
-     * Optional hard ceiling for total active cluster nodes.
-     * Default: 0 (Disabled / Uncapped).
-     * 
-     * WARNING: Setting maxClusterSize > 0 can be dangerous in production.
-     * Capping cluster growth under sudden, severe traffic spikes prevents the autoscaler
-     * from provisioning necessary compute, potentially leading to load starvation, high latency,
-     * or cascading OOM crashes across capped nodes. Use primarily for budget caps or testing/dev environments.
-     */
-    maxClusterSize: 0,
-    /**
-     * Geo-Aware Auto Scaling flag.
-     * Default: true.
-     * 
-     * When enabled, the autoscaler aggregates active client locations/timezones across nodes
-     * to determine the optimal geographical region for new server instances, allowing 
-     * infrastructure orchestrators to deploy nodes at the edge nearest to high-density user clusters.
-     */
-    geoScaling: true
+    // HORIZONTAL THRESHOLDS & SCALE OUT
+    scaleOut: {
+        cpuThreshold: 85,          // % CPU trigger
+        memoryThreshold: 85,       // % Memory trigger
+        consecutiveFlushes: 3,     // Sustained load required
+        maxClusterSize: 0          // Global ceiling (0 = uncapped)
+    },
+
+    // SCALE IN THRESHOLDS & STRATEGY
+    scaleIn: {
+        cpuThreshold: 10,          // % CPU low load trigger
+        memoryThreshold: 45,       // % Memory low load trigger
+        consecutiveFlushes: 10,    // Sustained low load (~10 min window)
+        preservation: "continent", // "global" | "continent" | "country" | "region"
+        minClusterSize: 2,         // Minimum cluster floor
+        decommissionStrategy: "local" // "local" (autonomous self-decommissioning) | "oldest" (target oldest idle node)
+    },
+
+    // GEO-SCALING & EDGE SHEDDING
+    geoScale: {
+        enabled: true,
+        sheddingThreshold: 20,     // % unserved traffic required to spawn edge node
+        densityBy: "continent"     // "continent" | "country" | "region"
+    },
+
+    // REGIONAL VERTICAL TIERING
+    vertical: {
+        enabled: true,
+        maxNodesPerTier: 2,        // Up to 2 horizontal nodes per tier in a region before stepping up to next tier
+        tiers: [
+            { name: "nano",    vCPU: 1,  memoryGb: 2 },
+            { name: "small",   vCPU: 2,  memoryGb: 8 },
+            { name: "medium",  vCPU: 4,  memoryGb: 16 },
+            { name: "large",   vCPU: 8,  memoryGb: 32 },
+            { name: "xlarge",  vCPU: 16, memoryGb: 64 },
+            { name: "2xlarge", vCPU: 32, memoryGb: 128 },
+            { name: "4xlarge", vCPU: 64, memoryGb: 256 }
+        ]
+    }
 };
 
 /**
- * Issues an immediate cordon command for a specific worker thread to halt incoming traffic routing.
- * Executed instantly on memory peak ticks or sustained CPU flushes.
+ * Queries the database via CRUD for active servers matching given filter query where master is running.
+ * Accepts optional query parameters to target specific geographic zones or regions.
  * 
- * @param {Object} telemetry - Current telemetry payload
+ * @param {Object} [query={}] - Optional query filters to merge with default master status
+ * @returns {Object|null} Cluster snapshot including averages and raw active servers array
  */
-function cordonWorkerNode(telemetry) {
-    const workerId = telemetry.workerId || telemetry.worker_id || process.pid;
-    console.warn(`[@cocreate/server-autoscaler] High load threshold detected on worker ${workerId}. Cordoning worker immediately...`);
-
-    // Standardized single-worker IPC Cordon dispatch
-    if (typeof cordon === 'function') {
-        cordon({
-            worker: workerId,
-            reason: 'Autoscaler threshold breached',
-            timestamp: Date.now()
-        });
-    } else if (server?.cordon) {
-        server.cordon({
-            worker: workerId,
-            reason: 'Autoscaler threshold breached',
-            timestamp: Date.now()
-        });
-    }
-}
-
-/**
- * Calculates average CPU and Memory utilization across all workers on the local node.
- * 
- * @param {Object} telemetry - Current telemetry payload
- * @returns {Object} Node averages for CPU and Memory
- */
-function calculateNodeAverage(telemetry) {
-    if (telemetry.workers && Array.isArray(telemetry.workers) && telemetry.workers.length > 0) {
-        let totalCpu = 0;
-        let totalMem = 0;
-        
-        telemetry.workers.forEach(w => {
-            totalCpu += (w.cpu?.usage || w.cpu || 0);
-            totalMem += (w.memory?.percentage || w.memory?.used_pct || 0);
-        });
-
-        return {
-            avgCpu: totalCpu / telemetry.workers.length,
-            avgMemory: totalMem / telemetry.workers.length
-        };
-    }
-
-    return {
-        avgCpu: telemetry.cpu?.avg || telemetry.cpu?.totalUsage || 0,
-        avgMemory: telemetry.memory?.avg_used_pct || telemetry.memory?.percentage || 0
-    };
-}
-
-/**
- * Queries the database via CRUD for all active servers where master process is running
- * and extracts their latest telemetry data to compute overall cluster averages.
- * Includes all active servers for simple, direct cluster-wide average calculations.
- * 
- * @returns {Object|null} Telemetry averages and total load across active servers
- */
-async function getClusterLatestFlushAverages() {
-    if (!server?.crud) {
-        console.warn("[@cocreate/server-autoscaler] CRUD layer unavailable. Skipping cluster-wide database check.");
-        return null;
-    }
-
+async function getClusterDetails(query = {}) {
     try {
-        // Query servers array for all active servers where master is running
+        // Query servers array for active servers where master is running
         const readResponse = await server.crud.send({
             method: 'object.read',
             array: 'servers',
             $filter: {
                 query: {
-                    'master.status': 'running'
+                    'master.status': 'running',
+                    ...query
                 }
             },
             organization_id: server.organization_id,
@@ -144,118 +99,121 @@ async function getClusterLatestFlushAverages() {
         });
 
         const activeServers = Array.isArray(readResponse?.object) ? readResponse.object : [];
-        
+        if (activeServers.length === 0) return null;
+
         let totalCpu = 0;
         let totalMem = 0;
-        let count = 0;
 
         for (const serverRecord of activeServers) {
-            const peerTelemetry = serverRecord.telemetry || serverRecord.serverTelemetry;
-            if (peerTelemetry) {
-                const peerCpu = peerTelemetry.cpu?.avg || peerTelemetry.cpu?.totalUsage || 0;
-                const peerMem = peerTelemetry.memory?.avg_used_pct || peerTelemetry.memory?.percentage || 0;
-                
-                totalCpu += peerCpu;
-                totalMem += peerMem;
-                count++;
-            }
+            const peerTelemetry = serverRecord.telemetry;
+            totalCpu += peerTelemetry?.cpu?.totalUsage || 0;
+            totalMem += peerTelemetry?.memory?.percentage || 0;
         }
 
-        if (count === 0) return null;
+        const count = activeServers.length;
 
         return {
             avgCpu: totalCpu / count,
             avgMemory: totalMem / count,
             totalCpu,
             totalMem,
-            totalCount: count
+            totalCount: count,
+            servers: activeServers // Raw active server array from database
         };
     } catch (err) {
-        console.error("[@cocreate/server-autoscaler] Error querying cluster server telemetries from DB:", err.message);
+        console.error("[@cocreate/server-autoscaler] Error querying cluster details from DB:", err.message);
         return null;
     }
 }
 
-
-
 /**
- * Validates whether scaling up is necessary by checking Node-level average first,
+ * Validates whether scaling out is necessary by checking Node-level average first,
  * followed by single-flush Cluster capacity from active server records in the database.
  * Also enforces maxClusterSize if explicitly configured (> 0).
  * 
  * @param {Object} telemetry - Telemetry payload frame
- * @returns {boolean} True if scaling up is authorized, False if cordoning alone is sufficient or max cap reached
+ * @returns {boolean} True if scaling out is authorized, False if cordoning alone is sufficient or max cap reached
  */
-async function shouldScaleUpCluster(telemetry) {
-    const scaleUpCpu = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleUpCpuThreshold'), 10) || defaults.scaleUpCpuThreshold;
-    const targetMemory = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleUpMemoryThreshold'), 10) || defaults.scaleUpMemoryThreshold;
-    const maxClusterSize = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.maxClusterSize'), 10) || defaults.maxClusterSize;
+async function shouldScaleOutCluster(telemetry) {
+    const scaleOutCpu = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleOut.cpuThreshold'), 10) || defaults.scaleOut.cpuThreshold;
+    const targetMemory = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleOut.memoryThreshold'), 10) || defaults.scaleOut.memoryThreshold;
+    const maxClusterSize = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleOut.maxClusterSize'), 10) || defaults.scaleOut.maxClusterSize;
 
     // STEP 1: Evaluate local Node average across workers
     const nodeAvg = calculateNodeAverage(telemetry);
     console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 1] Node Average -> CPU: ${nodeAvg.avgCpu.toFixed(1)}%, Memory: ${nodeAvg.avgMemory.toFixed(1)}%`);
 
-    const isNodeOverloaded = nodeAvg.avgCpu >= scaleUpCpu || nodeAvg.avgMemory >= targetMemory;
+    const isNodeOverloaded = nodeAvg.avgCpu >= scaleOutCpu || nodeAvg.avgMemory >= targetMemory;
 
     if (!isNodeOverloaded) {
-        console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 1] Node average is below thresholds. Cordoning worker is sufficient. Scaling up CANCELLED.`);
+        console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 1] Node average is below thresholds. Cordoning worker is sufficient. Scaling out CANCELLED.`);
         return false;
     }
 
     // STEP 2: Evaluate Cluster capacity across all running servers in DB
-    console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 2] Node is overloaded. Querying DB for active server telemetries...`);
-    const clusterAvg = await getClusterLatestFlushAverages();
+    console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 2] Node is overloaded. Querying DB for active cluster details...`);
+    const clusterData = await getClusterDetails();
 
-    if (clusterAvg && clusterAvg.totalCount > 0) {
-        console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 2] Cluster Average (${clusterAvg.totalCount} servers) -> CPU: ${clusterAvg.avgCpu.toFixed(1)}%, Memory: ${clusterAvg.avgMemory.toFixed(1)}%`);
+    if (clusterData && clusterData.totalCount > 0) {
+        console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 2] Cluster Average (${clusterData.totalCount} servers) -> CPU: ${clusterData.avgCpu.toFixed(1)}%, Memory: ${clusterData.avgMemory.toFixed(1)}%`);
         
         // Check optional hard cluster size ceiling (if configured)
-        if (maxClusterSize > 0 && clusterAvg.totalCount >= maxClusterSize) {
-            console.warn(`[@cocreate/server-autoscaler] [EVALUATION TIER 2] Max cluster size ceiling reached (${clusterAvg.totalCount}/${maxClusterSize}). Scaling up CANCELLED.`);
+        if (maxClusterSize > 0 && clusterData.totalCount >= maxClusterSize) {
+            console.warn(`[@cocreate/server-autoscaler] [EVALUATION TIER 2] Max cluster size ceiling reached (${clusterData.totalCount}/${maxClusterSize}). Scaling out CANCELLED.`);
             return false;
         }
 
-        const isClusterOverloaded = clusterAvg.avgCpu >= scaleUpCpu || clusterAvg.avgMemory >= targetMemory;
+        const isClusterOverloaded = clusterData.avgCpu >= scaleOutCpu || clusterData.avgMemory >= targetMemory;
 
         if (!isClusterOverloaded) {
-            console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 2] Remaining cluster has adequate capacity. Cordoning will rebalance traffic. Scaling up CANCELLED.`);
+            console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 2] Remaining cluster has adequate capacity. Cordoning will rebalance traffic. Scaling out CANCELLED.`);
             return false;
         }
     } else {
         console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 2] Server telemetries unavailable in DB. Proceeding with node-based scaling decision.`);
     }
 
-    console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 2] Average cluster threshold met. Scaling up authorized.`);
     return true;
 }
 
 /**
- * Queries the shared servers directory database to ensure we can safely remove this node 
- * without bringing the remaining active nodes below our configured minimum bounds
- * and verifies that redistributing all load across remaining nodes will not breach thresholds.
+ * Evaluates whether it is safe for a node to scale in.
+ * Verifies global minimum limits, regional preservation, and projected cluster capacity.
  * 
- * @param {Object} telemetry - Current telemetry snapshot
- * @returns {boolean} Verified consensus state allowing scale-down
+ * @param {Object} telemetry - Telemetry context frame
+ * @returns {boolean} True if node scale-in is authorized
  */
-async function isClusterSafeToScaleDown(telemetry) {
-    if (!server?.crud) {
-        console.warn("[@cocreate/server-autoscaler] Database access layer is unavailable. Scaling down rejected.");
-        return false;
+async function shouldScaleInCluster(telemetry) {
+    const minSize = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleIn.minClusterSize'), 10) || defaults.scaleIn.minClusterSize;
+    const scaleOutCpu = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleOut.cpuThreshold'), 10) || defaults.scaleOut.cpuThreshold;
+    const targetMemory = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleOut.memoryThreshold'), 10) || defaults.scaleOut.memoryThreshold;
+    const preservation = getValueFromObject(autoscaleConfig, 'autoscale.scaleIn.preservation') ?? defaults.scaleIn.preservation;
+
+    // Evaluate geographic preservation if enabled ("continent" | "country" | "region")
+    if (preservation && preservation !== "global") {
+        const localZone = server?.location?.[preservation] || server?.[preservation];
+        if (localZone) {
+            // Targeted query for active servers in this node's geographic zone
+            const zoneClusterData = await getClusterDetails({
+                [`location.${preservation}`]: localZone
+            });
+
+            if (!zoneClusterData || zoneClusterData.totalCount <= 1) {
+                console.log(`[@cocreate/server-autoscaler] [CONSENSUS] Scale-in rejected. Removing this node would leave '${localZone}' with no active nodes (Preservation: ${preservation}).`);
+                return false;
+            }
+        }
     }
 
-    const minSize = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.minClusterSize'), 10) || defaults.minClusterSize;
-    const scaleUpCpu = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleUpCpuThreshold'), 10) || defaults.scaleUpCpuThreshold;
-    const targetMemory = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleUpMemoryThreshold'), 10) || defaults.scaleUpMemoryThreshold;
-
-    const clusterData = await getClusterLatestFlushAverages();
+    const clusterData = await getClusterDetails();
 
     if (!clusterData || clusterData.totalCount <= 1) {
-        console.log(`[@cocreate/server-autoscaler] [CONSENSUS] Scale-down rejected. Insufficient active nodes found.`);
+        console.log(`[@cocreate/server-autoscaler] [CONSENSUS] Scale-in rejected. Insufficient active nodes found.`);
         return false;
     }
 
     if (clusterData.totalCount <= minSize) {
-        console.log(`[@cocreate/server-autoscaler] [CONSENSUS] Scale-down rejected. Active nodes (${clusterData.totalCount}) is already at or below the minimum cluster limit (${minSize}).`);
+        console.log(`[@cocreate/server-autoscaler] [CONSENSUS] Scale-in rejected. Active nodes (${clusterData.totalCount}) is already at or below the minimum cluster limit (${minSize}).`);
         return false;
     }
 
@@ -264,28 +222,28 @@ async function isClusterSafeToScaleDown(telemetry) {
     const projectedCpu = clusterData.totalCpu / remainingCount;
     const projectedMemory = clusterData.totalMem / remainingCount;
 
-    console.log(`[@cocreate/server-autoscaler] [SCALE DOWN CHECK] Projected remaining cluster load (${remainingCount} servers) -> CPU: ${projectedCpu.toFixed(1)}%, Memory: ${projectedMemory.toFixed(1)}%`);
+    console.log(`[@cocreate/server-autoscaler] [SCALE IN CHECK] Projected remaining cluster load (${remainingCount} servers) -> CPU: ${projectedCpu.toFixed(1)}%, Memory: ${projectedMemory.toFixed(1)}%`);
 
-    if (projectedCpu >= scaleUpCpu || projectedMemory >= targetMemory) {
-        console.log(`[@cocreate/server-autoscaler] [CONSENSUS] Scale-down rejected. Removing this node would push remaining cluster load above scale-up thresholds.`);
+    if (projectedCpu >= scaleOutCpu || projectedMemory >= targetMemory) {
+        console.log(`[@cocreate/server-autoscaler] [CONSENSUS] Scale-in rejected. Removing this node would push remaining cluster load above scale-out thresholds.`);
         return false;
     }
 
-    console.log(`[@cocreate/server-autoscaler] [CONSENSUS] Average cluster threshold met for scale-down. Scale-down authorized. Node marked for scale down.`);
+    console.log(`[@cocreate/server-autoscaler] [CONSENSUS] Average cluster threshold met for scale-in. Scale-in authorized. Node marked for scale in.`);
     return true;
 }
 
 /**
  * Triggers external cloud infrastructure provisioning APIs to add or remove node instances.
- * Incorporates geographic edge targeting metadata when scale-up is requested.
+ * Incorporates geographic edge targeting metadata and maxNodesPerTier vertical tier checks.
  * 
- * @param {string} action - 'up' or 'down'
+ * @param {string} action - 'out' or 'in'
  * @param {Object} telemetry - Telemetry context frame
  * @param {Object} meta - Optional metadata specs
  */
 async function executeScaleAction(action, telemetry, meta = {}) {
-    // If scaling up, calculate optimal edge geographic region based on active client density
-    if (action === 'up') {
+    // If scaling out, calculate target region and determine spec tier using maxNodesPerTier
+    if (action === 'out') {
         const clients = Array.from(
             server?.wsManager?.clients?.values() ?? [], 
             client => client?.clientInfo
@@ -295,6 +253,45 @@ async function executeScaleAction(action, telemetry, meta = {}) {
         if (geoTarget) {
             meta.geo = geoTarget;
             console.log(`[@cocreate/server-autoscaler] Geo-Scaling active. Requesting provision in region: ${geoTarget.targetRegion}`);
+        }
+
+        // Check regional tier counts against maxNodesPerTier to decide whether to upgrade tier
+        const maxNodesPerTier = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.vertical.maxNodesPerTier'), 10) || defaults.vertical.maxNodesPerTier;
+        const tiers = getValueFromObject(autoscaleConfig, 'autoscale.vertical.tiers') || defaults.vertical.tiers;
+        
+        const targetRegion = geoTarget?.targetRegion || server?.infrastructure?.region || 'default-region';
+        
+        // Targeted query for servers in the specific target infrastructure region
+        const regionalClusterData = await getClusterDetails({
+            'infrastructure.region': targetRegion
+        });
+
+        if (regionalClusterData && Array.isArray(regionalClusterData.servers)) {
+            const regionalTierCounts = {};
+            for (const serverRecord of regionalClusterData.servers) {
+                const peerTelemetry = serverRecord.telemetry;
+                const vCPU = peerTelemetry?.cpu?.cores?.length || serverRecord.totalWorkers || 1;
+                const memoryTotalBytes = peerTelemetry?.memory?.total || 0;
+                const memoryGb = memoryTotalBytes > 0 ? Math.round(memoryTotalBytes / (1024 * 1024 * 1024)) : 2;
+
+                const tier = matchTierName(vCPU, memoryGb);
+                regionalTierCounts[tier] = (regionalTierCounts[tier] || 0) + 1;
+            }
+
+            let selectedTier = tiers[0]; // Start at smallest tier (e.g., nano)
+
+            for (const tierSpec of tiers) {
+                const countAtTier = regionalTierCounts[tierSpec.name] || 0;
+                if (countAtTier < maxNodesPerTier) {
+                    selectedTier = tierSpec;
+                    break;
+                }
+                // If maxNodesPerTier reached, step up to next tier spec
+                selectedTier = tierSpec;
+            }
+
+            meta.tier = selectedTier;
+            console.log(`[@cocreate/server-autoscaler] Vertical Tiering selected spec '${selectedTier.name}' (${selectedTier.vCPU} vCPU, ${selectedTier.memoryGb} GB RAM) for region '${targetRegion}'.`);
         }
     }
 
@@ -315,25 +312,24 @@ async function executeScaleAction(action, telemetry, meta = {}) {
  * Processes telemetry frame payloads.
  * - Memory evaluated INSTANTLY on every TICK to protect against sudden heap OOM crashes.
  * - CPU evaluated across SUSTAINED FLUSHES to avoid over-provisioning on transient spikes.
- * - Scale down evaluated across DEBOUNCED LOW FLUSHES (default 60% CPU / 60% Memory over 10 flushes).
+ * - Scale down evaluated across DEBOUNCED LOW FLUSHES.
  * 
  * @param {Object} telemetry - Telemetry frame payload received on tick or flush dispatch
  */
 async function processTelemetryFrame(telemetry) {
     if (!isRunning) return;
 
-    const scaleUpCpu = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleUpCpuThreshold'), 10) || defaults.scaleUpCpuThreshold;
-    const scaleDownCpu = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleDownCpuThreshold'), 10) || defaults.scaleDownCpuThreshold;
-    const targetMemoryThreshold = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleUpMemoryThreshold'), 10) || defaults.scaleUpMemoryThreshold;
-    const scaleDownMemory = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleDownMemoryThreshold'), 10) || defaults.scaleDownMemoryThreshold;
-    const spikesRequired = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.consecutiveCpuSpikesRequired'), 10) || defaults.consecutiveCpuSpikesRequired;
-    const lowFlushesRequired = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.consecutiveLowFlushesRequired'), 10) || defaults.consecutiveLowFlushesRequired;
+    const scaleOutCpu = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleOut.cpuThreshold'), 10) || defaults.scaleOut.cpuThreshold;
+    const scaleInCpu = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleIn.cpuThreshold'), 10) || defaults.scaleIn.cpuThreshold;
+    const targetMemoryThreshold = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleOut.memoryThreshold'), 10) || defaults.scaleOut.memoryThreshold;
+    const scaleInMemory = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleIn.memoryThreshold'), 10) || defaults.scaleIn.memoryThreshold;
+    const spikesRequired = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleOut.consecutiveFlushes'), 10) || defaults.scaleOut.consecutiveFlushes;
+    const lowFlushesRequired = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleIn.consecutiveFlushes'), 10) || defaults.scaleIn.consecutiveFlushes;
 
-    const cpuAvg = telemetry.cpu?.avg || 0;
-    const memoryAvg = telemetry.memory?.avg_used_pct || 0;
+    const cpuAvg = telemetry.cpu?.totalUsage || 0;
+    const memoryAvg = telemetry.memory?.percentage || 0;
 
     // TRACK 1: INSTANT PER-TICK MEMORY EVALUATION
-    // Memory is incompressible — if memory peaks on a tick, cordoning & scale verification must trigger IMMEDIATELY
     const isMemoryPeaked = memoryAvg >= targetMemoryThreshold;
 
     if (isMemoryPeaked) {
@@ -341,24 +337,23 @@ async function processTelemetryFrame(telemetry) {
         
         cordonWorkerNode(telemetry);
 
-        const authorized = await shouldScaleUpCluster(telemetry);
+        const authorized = await shouldScaleOutCluster(telemetry);
         if (authorized) {
             consecutiveCpuSpikes = 0;
-            await executeScaleAction('up', telemetry, { spec: 'memory-optimized', trigger: 'memory-instant-tick' });
+            await executeScaleAction('out', telemetry, { spec: 'memory-optimized', trigger: 'memory-instant-tick' });
         }
         return;
     }
 
     // TRACK 2: SUSTAINED FLUSH-BASED CPU EVALUATION
-    // CPU is bursty — CPU requires consecutive flushes above threshold before triggering scale actions
-    if (cpuAvg >= scaleUpCpu) {
+    if (cpuAvg >= scaleOutCpu) {
         consecutiveCpuSpikes++;
         consecutiveLowLoadFlushes = 0; 
     } else {
         consecutiveCpuSpikes = 0; 
     }
 
-    const isUnderloaded = cpuAvg <= scaleDownCpu && memoryAvg <= scaleDownMemory;
+    const isUnderloaded = cpuAvg <= scaleInCpu && memoryAvg <= scaleInMemory;
 
     if (isUnderloaded) {
         consecutiveLowLoadFlushes++;
@@ -369,28 +364,28 @@ async function processTelemetryFrame(telemetry) {
     const isCpuSustainedPeak = consecutiveCpuSpikes >= spikesRequired;
 
     if (isCpuSustainedPeak) {
-        console.warn(`[@cocreate/server-autoscaler] [SUSTAINED FLUSH] Sustained CPU threshold exceeded for ${consecutiveCpuSpikes} consecutive flushes (${cpuAvg}% >= limit: ${scaleUpCpu}%). Triggering worker cordon & scale evaluation...`);
+        console.warn(`[@cocreate/server-autoscaler] [SUSTAINED FLUSH] Sustained CPU threshold exceeded for ${consecutiveCpuSpikes} consecutive flushes (${cpuAvg}% >= limit: ${scaleOutCpu}%). Triggering worker cordon & scale evaluation...`);
 
         cordonWorkerNode(telemetry);
 
-        const authorized = await shouldScaleUpCluster(telemetry);
+        const authorized = await shouldScaleOutCluster(telemetry);
         if (authorized) {
             consecutiveCpuSpikes = 0; 
-            await executeScaleAction('up', telemetry, { spec: 'compute-optimized', trigger: 'cpu-sustained-flushes' });
+            await executeScaleAction('out', telemetry, { spec: 'compute-optimized', trigger: 'cpu-sustained-flushes' });
         }
         return;
     }
 
-    // TRACK 3: SCALE DOWN EVALUATION (SUSTAINED LOW LOAD ACROSS FLUSHES)
+    // TRACK 3: SCALE IN EVALUATION (SUSTAINED LOW LOAD ACROSS FLUSHES)
     if (consecutiveLowLoadFlushes >= lowFlushesRequired) {
         console.log(`[@cocreate/server-autoscaler] Low load sustained for ${consecutiveLowLoadFlushes} consecutive flushes. Checking cluster state to verify consensus...`);
         
-        const safeToScaleDown = await isClusterSafeToScaleDown(telemetry);
-        if (safeToScaleDown) {
+        const safeToScaleIn = await shouldScaleInCluster(telemetry);
+        if (safeToScaleIn) {
             consecutiveLowLoadFlushes = 0; 
             
-            console.log(`[@cocreate/server-autoscaler] Safe-down consensus verified. Scaling down...`);
-            await executeScaleAction('down', telemetry);
+            console.log(`[@cocreate/server-autoscaler] Safe-in consensus verified. Scaling in...`);
+            await executeScaleAction('in', telemetry);
         } else {
             consecutiveLowLoadFlushes = Math.round(lowFlushesRequired / 2); 
         }
