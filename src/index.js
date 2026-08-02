@@ -18,7 +18,7 @@
 
 import cluster from 'node:cluster';
 import config from '@cocreate/config';
-import { getValueFromObject } from '@cocreate/utils';
+import { getValueFromObject, dotNotationToObject } from '@cocreate/utils';
 import { getCloudProvider } from './geoScaling.js';
 
 // Guard clause verification to ensure cluster API abstraction integrity
@@ -30,7 +30,7 @@ let isRunning = false;
 
 const defaults = {
     autoscaler: {
-        clouds: [],
+        clouds: {},
         scaleOut: {
             cpuThreshold: 85,
             memoryThreshold: 85,
@@ -67,29 +67,12 @@ const defaults = {
 };
 
 /**
- * Utility function to deeply merge source object properties into a target object.
- */
-function mergeDeep(target, ...sources) {
-    if (!target || typeof target !== 'object') target = {};
-    for (const source of sources) {
-        if (!source || typeof source !== 'object') continue;
-        for (const key of Object.keys(source)) {
-            if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
-                if (!target[key] || typeof target[key] !== 'object') {
-                    target[key] = {};
-                }
-                mergeDeep(target[key], source[key]);
-            } else if (source[key] !== undefined) {
-                target[key] = source[key];
-            }
-        }
-    }
-    return target;
-}
-
-/**
  * Loads system configuration using @cocreate/config, queries the database's 'servers_config'
- * collection via config.query for matching 'autoscaler' entries, and merges database configurations over system config.
+ * collection via config.query for matching 'autoscaler' entries, and processes standard
+ * objects as well as dot-notation paths using `dotNotationToObject`.
+ * 
+ * Autoscaler is the sole module responsible for loading and resolving configuration early
+ * in the pipeline before passing the resolved object to downstream modules like GeoScaling.
  * 
  * @returns {Promise<Object>} The resolved autoscale configuration
  */
@@ -98,19 +81,39 @@ export async function loadAutoscaleConfig() {
 
     console.log("[@cocreate/server-autoscaler] Querying database for autoscale configs via config.query...");
 
-    const dbConfig = await config.query({
-        type: 'autoscaler',
-        organization_id: server.organization_id,
-        server: server.host,
-        cluster: server.cluster_id
-    });
+    let dbConfig = null;
+    if (server) {
+        dbConfig = await config.query({
+            type: 'autoscaler',
+            organization_id: server.organization_id,
+            server: server.host,
+            cluster: server.cluster_id
+        });
+    }
 
-    const normalizedSys = sysConfig && sysConfig.autoscaler ? sysConfig : { autoscaler: sysConfig };
-    const normalizedDb = dbConfig && dbConfig.autoscaler ? dbConfig : { autoscaler: dbConfig };
+    const mergedTarget = {};
 
-    autoscaleConfig = mergeDeep({}, defaults, normalizedSys, normalizedDb);
+    // 1. Apply system defaults
+    dotNotationToObject(defaults, mergedTarget);
 
-    console.log("[@cocreate/server-autoscaler] Configuration successfully resolved and merged.");
+    // 2. Expand & merge system configuration
+    if (sysConfig) {
+        const sysData = sysConfig.autoscaler ? sysConfig.autoscaler : sysConfig;
+        dotNotationToObject(sysData, mergedTarget.autoscaler || mergedTarget);
+    }
+
+    // 3. Expand & merge database overrides
+    if (dbConfig) {
+        const docs = Array.isArray(dbConfig) ? dbConfig : [dbConfig];
+        for (const doc of docs) {
+            const innerPayload = doc.config || doc;
+            dotNotationToObject(innerPayload, mergedTarget.autoscaler || mergedTarget);
+        }
+    }
+
+    autoscaleConfig = mergedTarget.autoscaler ? mergedTarget : { autoscaler: mergedTarget };
+
+    console.log("[@cocreate/server-autoscaler] Configuration successfully resolved and merged via dotNotationToObject.");
 
     return autoscaleConfig;
 }
@@ -175,7 +178,7 @@ function determineTargetTier(targetRegion, activeClusterServers) {
         return { ...tiers[0], tierIndex: 0 };
     }
 
-    const regionalServers = activeClusterServers.filter(s => s.region === targetRegion || s.location.region === targetRegion);
+    const regionalServers = activeClusterServers.filter(s => s.region === targetRegion || s.location?.region === targetRegion);
 
     if (regionalServers.length === 0) {
         return { ...tiers[0], tierIndex: 0 };
@@ -232,12 +235,12 @@ function selectInstanceType(instances, targetTier) {
         return suitable[0].name;
     }
 
-    return instances[instances.length - 1].name;
+    return instances[instances.length - 1]?.name || 'default';
 }
 
 /**
  * Calculates full scale-out details without provisioning:
- * 1. Invokes getCloudProvider() to obtain target cloud provider, region, and instance catalog.
+ * 1. Invokes getCloudProvider() with autoscaleConfig passed directly.
  * 2. Queries active cluster state from DB to evaluate current nodes in that region.
  * 3. Evaluates vertical tier rules from autoscaleConfig to pick target vCPU / memory tier.
  * 4. Matches the required tier against the provider's instances array to determine the instanceType name.
@@ -426,6 +429,7 @@ export async function scaleIn(targetServer) {
 
 function createAutoscalerApi() {
     return {
+        loadAutoscaleConfig,
         scaleOut,
         determineScaleOutTarget,
         scaleIn,
@@ -442,6 +446,8 @@ export async function init(serverInstance) {
 
     server = serverInstance;
     console.log("[@cocreate/server-autoscaler] Initializing Autoscaler service...");
+
+    await loadAutoscaleConfig();
 
     isRunning = true;
     console.log("[@cocreate/server-autoscaler] Autoscaler service initialized successfully.");
