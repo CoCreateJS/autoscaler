@@ -1,5 +1,5 @@
 /********************************************************************************
- * Copyright (C) 2023 CoCreate and Contributors.
+ * Copyright (C) 2026 CoCreate and Contributors.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published
@@ -17,428 +17,438 @@
  ********************************************************************************/
 
 import cluster from 'node:cluster';
-import Config from '@cocreate/config';
+import config from '@cocreate/config';
 import { getValueFromObject } from '@cocreate/utils';
 import { getCloudProvider } from './geoScaling.js';
 
 // Guard clause verification to ensure cluster API abstraction integrity
 const isMaster = cluster.isMaster;
 
-let server = null;                // Central reference to CoCreateServer Master instance
-let autoscaleConfig = null;       // Configured thresholds and duration constants
-let isRunning = false;            // Execution loop flag
+let server = null;
+let autoscaleConfig = null;
+let isRunning = false;
 
-// Consecutive tracking counters to filter transient CPU spikes
-let consecutiveCpuSpikes = 0;
-let consecutiveLowLoadFlushes = 0;
-
-// Default operational values for telemetry-driven autoscale thresholds
 const defaults = {
-    // HORIZONTAL THRESHOLDS & SCALE OUT
-    scaleOut: {
-        cpuThreshold: 85,          // % CPU trigger
-        memoryThreshold: 85,       // % Memory trigger
-        consecutiveFlushes: 3,     // Sustained load required
-        maxClusterSize: 0          // Global ceiling (0 = uncapped)
-    },
-
-    // SCALE IN THRESHOLDS & STRATEGY
-    scaleIn: {
-        cpuThreshold: 10,          // % CPU low load trigger
-        memoryThreshold: 45,       // % Memory low load trigger
-        consecutiveFlushes: 10,    // Sustained low load (~10 min window)
-        preservation: "continent", // "global" | "continent" | "country" | "region"
-        minClusterSize: 2,         // Minimum cluster floor
-        decommissionStrategy: "local" // "local" (autonomous self-decommissioning) | "oldest" (target oldest idle node)
-    },
-
-    // GEO-SCALING & EDGE SHEDDING
-    geoScale: {
-        enabled: true,
-        sheddingThreshold: 20,     // % unserved traffic required to spawn edge node
-        densityBy: "continent"     // "continent" | "country" | "region"
-    },
-
-    // REGIONAL VERTICAL TIERING
-    vertical: {
-        enabled: true,
-        maxNodesPerTier: 2,        // Up to 2 horizontal nodes per tier in a region before stepping up to next tier
-        tiers: [
-            { name: "nano",    vCPU: 1,  memoryGb: 2 },
-            { name: "small",   vCPU: 2,  memoryGb: 8 },
-            { name: "medium",  vCPU: 4,  memoryGb: 16 },
-            { name: "large",   vCPU: 8,  memoryGb: 32 },
-            { name: "xlarge",  vCPU: 16, memoryGb: 64 },
-            { name: "2xlarge", vCPU: 32, memoryGb: 128 },
-            { name: "4xlarge", vCPU: 64, memoryGb: 256 }
-        ]
+    autoscaler: {
+        clouds: [],
+        scaleOut: {
+            cpuThreshold: 85,
+            memoryThreshold: 85,
+            consecutiveFlushes: 3,
+            maxClusterSize: 0
+        },
+        scaleIn: {
+            cpuThreshold: 10,
+            memoryThreshold: 45,
+            consecutiveFlushes: 10,
+            preservation: "continent",
+            minClusterSize: 2,
+            decommissionStrategy: "oldest"
+        },
+        geoScale: {
+            enabled: true,
+            sheddingThreshold: 20,
+            densityBy: "continent"
+        },
+        vertical: {
+            enabled: true,
+            maxNodesPerTier: 2,
+            tiers: [
+                { vCPU: 1, memoryGb: 2 },
+                { vCPU: 2, memoryGb: 8 },
+                { vCPU: 4, memoryGb: 16 },
+                { vCPU: 8, memoryGb: 32 },
+                { vCPU: 16, memoryGb: 64 },
+                { vCPU: 32, memoryGb: 128 },
+                { vCPU: 64, memoryGb: 256 }
+            ]
+        }
     }
 };
 
 /**
- * Queries the database via CRUD for active servers matching given filter query where master is running.
- * Accepts optional query parameters to target specific geographic zones or regions.
- * 
- * @param {Object} [query={}] - Optional query filters to merge with default master status
- * @returns {Object|null} Cluster snapshot including averages and raw active servers array
+ * Utility function to deeply merge source object properties into a target object.
  */
-async function getClusterDetails(query = {}) {
-    try {
-        // Query servers array for active servers where master is running
-        const readResponse = await server.crud.send({
-            method: 'object.read',
-            array: 'servers',
-            $filter: {
-                query: {
-                    'master.status': 'running',
-                    ...query
+function mergeDeep(target, ...sources) {
+    if (!target || typeof target !== 'object') target = {};
+    for (const source of sources) {
+        if (!source || typeof source !== 'object') continue;
+        for (const key of Object.keys(source)) {
+            if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
+                if (!target[key] || typeof target[key] !== 'object') {
+                    target[key] = {};
                 }
-            },
-            organization_id: server.organization_id,
-            host: server.host
-        });
-
-        const activeServers = Array.isArray(readResponse?.object) ? readResponse.object : [];
-        if (activeServers.length === 0) return null;
-
-        let totalCpu = 0;
-        let totalMem = 0;
-
-        for (const serverRecord of activeServers) {
-            const peerTelemetry = serverRecord.telemetry;
-            totalCpu += peerTelemetry?.cpu?.totalUsage || 0;
-            totalMem += peerTelemetry?.memory?.percentage || 0;
-        }
-
-        const count = activeServers.length;
-
-        return {
-            avgCpu: totalCpu / count,
-            avgMemory: totalMem / count,
-            totalCpu,
-            totalMem,
-            totalCount: count,
-            servers: activeServers // Raw active server array from database
-        };
-    } catch (err) {
-        console.error("[@cocreate/server-autoscaler] Error querying cluster details from DB:", err.message);
-        return null;
-    }
-}
-
-/**
- * Validates whether scaling out is necessary by checking Node-level average first,
- * followed by single-flush Cluster capacity from active server records in the database.
- * Also enforces maxClusterSize if explicitly configured (> 0).
- * 
- * @param {Object} telemetry - Telemetry payload frame
- * @returns {boolean} True if scaling out is authorized, False if cordoning alone is sufficient or max cap reached
- */
-async function shouldScaleOutCluster(telemetry) {
-    const scaleOutCpu = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleOut.cpuThreshold'), 10) || defaults.scaleOut.cpuThreshold;
-    const targetMemory = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleOut.memoryThreshold'), 10) || defaults.scaleOut.memoryThreshold;
-    const maxClusterSize = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleOut.maxClusterSize'), 10) || defaults.scaleOut.maxClusterSize;
-
-    // STEP 1: Evaluate local Node average across workers
-    const nodeAvg = calculateNodeAverage(telemetry);
-    console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 1] Node Average -> CPU: ${nodeAvg.avgCpu.toFixed(1)}%, Memory: ${nodeAvg.avgMemory.toFixed(1)}%`);
-
-    const isNodeOverloaded = nodeAvg.avgCpu >= scaleOutCpu || nodeAvg.avgMemory >= targetMemory;
-
-    if (!isNodeOverloaded) {
-        console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 1] Node average is below thresholds. Cordoning worker is sufficient. Scaling out CANCELLED.`);
-        return false;
-    }
-
-    // STEP 2: Evaluate Cluster capacity across all running servers in DB
-    console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 2] Node is overloaded. Querying DB for active cluster details...`);
-    const clusterData = await getClusterDetails();
-
-    if (clusterData && clusterData.totalCount > 0) {
-        console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 2] Cluster Average (${clusterData.totalCount} servers) -> CPU: ${clusterData.avgCpu.toFixed(1)}%, Memory: ${clusterData.avgMemory.toFixed(1)}%`);
-        
-        // Check optional hard cluster size ceiling (if configured)
-        if (maxClusterSize > 0 && clusterData.totalCount >= maxClusterSize) {
-            console.warn(`[@cocreate/server-autoscaler] [EVALUATION TIER 2] Max cluster size ceiling reached (${clusterData.totalCount}/${maxClusterSize}). Scaling out CANCELLED.`);
-            return false;
-        }
-
-        const isClusterOverloaded = clusterData.avgCpu >= scaleOutCpu || clusterData.avgMemory >= targetMemory;
-
-        if (!isClusterOverloaded) {
-            console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 2] Remaining cluster has adequate capacity. Cordoning will rebalance traffic. Scaling out CANCELLED.`);
-            return false;
-        }
-    } else {
-        console.log(`[@cocreate/server-autoscaler] [EVALUATION TIER 2] Server telemetries unavailable in DB. Proceeding with node-based scaling decision.`);
-    }
-
-    return true;
-}
-
-/**
- * Evaluates whether it is safe for a node to scale in.
- * Verifies global minimum limits, regional preservation, and projected cluster capacity.
- * 
- * @param {Object} telemetry - Telemetry context frame
- * @returns {boolean} True if node scale-in is authorized
- */
-async function shouldScaleInCluster(telemetry) {
-    const minSize = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleIn.minClusterSize'), 10) || defaults.scaleIn.minClusterSize;
-    const scaleOutCpu = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleOut.cpuThreshold'), 10) || defaults.scaleOut.cpuThreshold;
-    const targetMemory = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleOut.memoryThreshold'), 10) || defaults.scaleOut.memoryThreshold;
-    const preservation = getValueFromObject(autoscaleConfig, 'autoscale.scaleIn.preservation') ?? defaults.scaleIn.preservation;
-
-    // Evaluate geographic preservation if enabled ("continent" | "country" | "region")
-    if (preservation && preservation !== "global") {
-        const localZone = server?.location?.[preservation] || server?.[preservation];
-        if (localZone) {
-            // Targeted query for active servers in this node's geographic zone
-            const zoneClusterData = await getClusterDetails({
-                [`location.${preservation}`]: localZone
-            });
-
-            if (!zoneClusterData || zoneClusterData.totalCount <= 1) {
-                console.log(`[@cocreate/server-autoscaler] [CONSENSUS] Scale-in rejected. Removing this node would leave '${localZone}' with no active nodes (Preservation: ${preservation}).`);
-                return false;
+                mergeDeep(target[key], source[key]);
+            } else if (source[key] !== undefined) {
+                target[key] = source[key];
             }
         }
     }
-
-    const clusterData = await getClusterDetails();
-
-    if (!clusterData || clusterData.totalCount <= 1) {
-        console.log(`[@cocreate/server-autoscaler] [CONSENSUS] Scale-in rejected. Insufficient active nodes found.`);
-        return false;
-    }
-
-    if (clusterData.totalCount <= minSize) {
-        console.log(`[@cocreate/server-autoscaler] [CONSENSUS] Scale-in rejected. Active nodes (${clusterData.totalCount}) is already at or below the minimum cluster limit (${minSize}).`);
-        return false;
-    }
-
-    // Calculate projected load on remaining nodes if this node is removed
-    const remainingCount = clusterData.totalCount - 1;
-    const projectedCpu = clusterData.totalCpu / remainingCount;
-    const projectedMemory = clusterData.totalMem / remainingCount;
-
-    console.log(`[@cocreate/server-autoscaler] [SCALE IN CHECK] Projected remaining cluster load (${remainingCount} servers) -> CPU: ${projectedCpu.toFixed(1)}%, Memory: ${projectedMemory.toFixed(1)}%`);
-
-    if (projectedCpu >= scaleOutCpu || projectedMemory >= targetMemory) {
-        console.log(`[@cocreate/server-autoscaler] [CONSENSUS] Scale-in rejected. Removing this node would push remaining cluster load above scale-out thresholds.`);
-        return false;
-    }
-
-    console.log(`[@cocreate/server-autoscaler] [CONSENSUS] Average cluster threshold met for scale-in. Scale-in authorized. Node marked for scale in.`);
-    return true;
+    return target;
 }
 
 /**
- * Triggers external cloud infrastructure provisioning APIs to add or remove node instances.
- * Incorporates geographic edge targeting metadata and maxNodesPerTier vertical tier checks.
+ * Loads system configuration using @cocreate/config, queries the database's 'servers_config'
+ * collection via config.query for matching 'autoscaler' entries, and merges database configurations over system config.
  * 
- * @param {string} action - 'out' or 'in'
- * @param {Object} telemetry - Telemetry context frame
- * @param {Object} meta - Optional metadata specs
+ * @returns {Promise<Object>} The resolved autoscale configuration
  */
-async function executeScaleAction(action, telemetry, meta = {}) {
-    // If scaling out, calculate target region and determine spec tier using maxNodesPerTier
-    if (action === 'out') {
-        const clients = Array.from(
-            server?.wsManager?.clients?.values() ?? [], 
-            client => client?.clientInfo
-        ).filter(Boolean);
-        
-        const geoTarget = getCloudProvider(clients, autoscaleConfig);    
-        if (geoTarget) {
-            meta.geo = geoTarget;
-            console.log(`[@cocreate/server-autoscaler] Geo-Scaling active. Requesting provision in region: ${geoTarget.targetRegion}`);
-        }
+export async function loadAutoscaleConfig() {
+    const sysConfig = await config.get('autoscaler');
 
-        // Check regional tier counts against maxNodesPerTier to decide whether to upgrade tier
-        const maxNodesPerTier = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.vertical.maxNodesPerTier'), 10) || defaults.vertical.maxNodesPerTier;
-        const tiers = getValueFromObject(autoscaleConfig, 'autoscale.vertical.tiers') || defaults.vertical.tiers;
-        
-        const targetRegion = geoTarget?.targetRegion || server?.infrastructure?.region || 'default-region';
-        
-        // Targeted query for servers in the specific target infrastructure region
-        const regionalClusterData = await getClusterDetails({
-            'infrastructure.region': targetRegion
-        });
+    console.log("[@cocreate/server-autoscaler] Querying database for autoscale configs via config.query...");
 
-        if (regionalClusterData && Array.isArray(regionalClusterData.servers)) {
-            const regionalTierCounts = {};
-            for (const serverRecord of regionalClusterData.servers) {
-                const peerTelemetry = serverRecord.telemetry;
-                const vCPU = peerTelemetry?.cpu?.cores?.length || serverRecord.totalWorkers || 1;
-                const memoryTotalBytes = peerTelemetry?.memory?.total || 0;
-                const memoryGb = memoryTotalBytes > 0 ? Math.round(memoryTotalBytes / (1024 * 1024 * 1024)) : 2;
-
-                const tier = matchTierName(vCPU, memoryGb);
-                regionalTierCounts[tier] = (regionalTierCounts[tier] || 0) + 1;
-            }
-
-            let selectedTier = tiers[0]; // Start at smallest tier (e.g., nano)
-
-            for (const tierSpec of tiers) {
-                const countAtTier = regionalTierCounts[tierSpec.name] || 0;
-                if (countAtTier < maxNodesPerTier) {
-                    selectedTier = tierSpec;
-                    break;
-                }
-                // If maxNodesPerTier reached, step up to next tier spec
-                selectedTier = tierSpec;
-            }
-
-            meta.tier = selectedTier;
-            console.log(`[@cocreate/server-autoscaler] Vertical Tiering selected spec '${selectedTier.name}' (${selectedTier.vCPU} vCPU, ${selectedTier.memoryGb} GB RAM) for region '${targetRegion}'.`);
-        }
-    }
-
-    console.log(`[@cocreate/server-autoscaler] Requesting infrastructure scale-${action.toUpperCase()}...`, meta);
-
-    // Emit event across server event bus for infrastructure orchestrator
-    if (server?.emit) {
-        server.emit('telemetry.scaleAction', {
-            action,
-            telemetry,
-            meta,
-            timestamp: Date.now()
-        });
-    }
-}
-
-/**
- * Processes telemetry frame payloads.
- * - Memory evaluated INSTANTLY on every TICK to protect against sudden heap OOM crashes.
- * - CPU evaluated across SUSTAINED FLUSHES to avoid over-provisioning on transient spikes.
- * - Scale down evaluated across DEBOUNCED LOW FLUSHES.
- * 
- * @param {Object} telemetry - Telemetry frame payload received on tick or flush dispatch
- */
-async function processTelemetryFrame(telemetry) {
-    if (!isRunning) return;
-
-    const scaleOutCpu = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleOut.cpuThreshold'), 10) || defaults.scaleOut.cpuThreshold;
-    const scaleInCpu = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleIn.cpuThreshold'), 10) || defaults.scaleIn.cpuThreshold;
-    const targetMemoryThreshold = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleOut.memoryThreshold'), 10) || defaults.scaleOut.memoryThreshold;
-    const scaleInMemory = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleIn.memoryThreshold'), 10) || defaults.scaleIn.memoryThreshold;
-    const spikesRequired = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleOut.consecutiveFlushes'), 10) || defaults.scaleOut.consecutiveFlushes;
-    const lowFlushesRequired = parseInt(getValueFromObject(autoscaleConfig, 'autoscale.scaleIn.consecutiveFlushes'), 10) || defaults.scaleIn.consecutiveFlushes;
-
-    const cpuAvg = telemetry.cpu?.totalUsage || 0;
-    const memoryAvg = telemetry.memory?.percentage || 0;
-
-    // TRACK 1: INSTANT PER-TICK MEMORY EVALUATION
-    const isMemoryPeaked = memoryAvg >= targetMemoryThreshold;
-
-    if (isMemoryPeaked) {
-        console.warn(`[@cocreate/server-autoscaler] [INSTANT TICK] Memory threshold exceeded (${memoryAvg}% >= limit: ${targetMemoryThreshold}%). Triggering immediate worker cordon & scale evaluation...`);
-        
-        cordonWorkerNode(telemetry);
-
-        const authorized = await shouldScaleOutCluster(telemetry);
-        if (authorized) {
-            consecutiveCpuSpikes = 0;
-            await executeScaleAction('out', telemetry, { spec: 'memory-optimized', trigger: 'memory-instant-tick' });
-        }
-        return;
-    }
-
-    // TRACK 2: SUSTAINED FLUSH-BASED CPU EVALUATION
-    if (cpuAvg >= scaleOutCpu) {
-        consecutiveCpuSpikes++;
-        consecutiveLowLoadFlushes = 0; 
-    } else {
-        consecutiveCpuSpikes = 0; 
-    }
-
-    const isUnderloaded = cpuAvg <= scaleInCpu && memoryAvg <= scaleInMemory;
-
-    if (isUnderloaded) {
-        consecutiveLowLoadFlushes++;
-    } else {
-        consecutiveLowLoadFlushes = 0;
-    }
-
-    const isCpuSustainedPeak = consecutiveCpuSpikes >= spikesRequired;
-
-    if (isCpuSustainedPeak) {
-        console.warn(`[@cocreate/server-autoscaler] [SUSTAINED FLUSH] Sustained CPU threshold exceeded for ${consecutiveCpuSpikes} consecutive flushes (${cpuAvg}% >= limit: ${scaleOutCpu}%). Triggering worker cordon & scale evaluation...`);
-
-        cordonWorkerNode(telemetry);
-
-        const authorized = await shouldScaleOutCluster(telemetry);
-        if (authorized) {
-            consecutiveCpuSpikes = 0; 
-            await executeScaleAction('out', telemetry, { spec: 'compute-optimized', trigger: 'cpu-sustained-flushes' });
-        }
-        return;
-    }
-
-    // TRACK 3: SCALE IN EVALUATION (SUSTAINED LOW LOAD ACROSS FLUSHES)
-    if (consecutiveLowLoadFlushes >= lowFlushesRequired) {
-        console.log(`[@cocreate/server-autoscaler] Low load sustained for ${consecutiveLowLoadFlushes} consecutive flushes. Checking cluster state to verify consensus...`);
-        
-        const safeToScaleIn = await shouldScaleInCluster(telemetry);
-        if (safeToScaleIn) {
-            consecutiveLowLoadFlushes = 0; 
-            
-            console.log(`[@cocreate/server-autoscaler] Safe-in consensus verified. Scaling in...`);
-            await executeScaleAction('in', telemetry);
-        } else {
-            consecutiveLowLoadFlushes = Math.round(lowFlushesRequired / 2); 
-        }
-    }
-}
-
-/**
- * Boots the autoscaler system exclusively on the Master/Primary process context.
- * 
- * @param {Object} serverInstance - Central CoCreateServer instance references
- * @returns {Object} Active autoscale control API
- */
-export async function init(serverInstance) {
-    server = serverInstance;
-    
-    if (!isMaster) {
-        console.log('[@cocreate/server-autoscaler] Autoscaler initialized on worker node (Standby).');
-        return;
-    }
-
-    try {
-        autoscaleConfig = await Config.get('autoscale');
-    } catch (e) {
-        console.warn('[@cocreate/server-autoscaler] Failed to load config, falling back to defaults.', e.message);
-        autoscaleConfig = {};
-    }
-
-    const isEnabled = getValueFromObject(autoscaleConfig, 'autoscale.enabled') !== false && getValueFromObject(autoscaleConfig, 'autoscale.enabled') !== 'false';
-
-    if (!isEnabled) {
-        console.log('[@cocreate/server-autoscaler] Autoscaling is disabled by configuration.');
-        return;
-    }
-
-    isRunning = true;
-
-    // Subscribe to incoming telemetry frame dispatches published by server-telemetry.js
-    server.on('telemetry', (telemetry) => {
-        processTelemetryFrame(telemetry);
+    const dbConfig = await config.query({
+        type: 'autoscaler',
+        organization_id: server.organization_id,
+        server: server.host,
+        cluster: server.cluster_id
     });
 
-    console.log('[@cocreate/server-autoscaler] Initialized and listening for telemetry on Master node.');
+    const normalizedSys = sysConfig && sysConfig.autoscaler ? sysConfig : { autoscaler: sysConfig };
+    const normalizedDb = dbConfig && dbConfig.autoscaler ? dbConfig : { autoscaler: dbConfig };
+
+    autoscaleConfig = mergeDeep({}, defaults, normalizedSys, normalizedDb);
+
+    console.log("[@cocreate/server-autoscaler] Configuration successfully resolved and merged.");
+
+    return autoscaleConfig;
 }
 
 /**
- * Halts any active autoscaler processing
+ * Queries the database via CRUD for active servers matching given filter query where master is running.
+ * 
+ * @param {Object} [query={}] - Optional query filters to merge with default master status
+ * @returns {Promise<Object>} Cluster snapshot including averages and raw active servers array
  */
-export function stop() {
-    isRunning = false;
-    console.log('[@cocreate/server-autoscaler] Execution loop halted.');
+async function getClusterDetails(query = {}) {
+    const readResponse = await server.crud.send({
+        method: 'object.read',
+        array: 'servers',
+        $filter: {
+            query: {
+                'master.status': 'running',
+                ...query
+            }
+        },
+        organization_id: server.organization_id,
+        host: server.host
+    });
+
+    const activeServers = readResponse.object;
+
+    let totalCpu = 0;
+    let totalMem = 0;
+
+    for (const serverRecord of activeServers) {
+        const peerTelemetry = serverRecord.telemetry;
+        totalCpu += peerTelemetry.cpu.totalUsage;
+        totalMem += peerTelemetry.memory.percentage;
+    }
+
+    const count = activeServers.length;
+
+    return {
+        avgCpu: totalCpu / count,
+        avgMemory: totalMem / count,
+        totalCpu,
+        totalMem,
+        totalCount: count,
+        servers: activeServers
+    };
 }
 
-export default { 
-    init, 
-    stop 
+/**
+ * Evaluates the vertical tiering policy and determines the target tier requirements
+ * (vCPU and Memory) for scaling in a given region based on current active nodes in that region.
+ * 
+ * @param {string} targetRegion - Target region identifier (e.g. 'us-east-1')
+ * @param {Array<Object>} activeClusterServers - Active servers running in cluster
+ * @returns {Object} Target tier specifications { vCPU, memoryGb, tierIndex }
+ */
+function determineTargetTier(targetRegion, activeClusterServers) {
+    const isVerticalEnabled = getValueFromObject(autoscaleConfig, 'autoscaler.vertical.enabled');
+    const tiers = getValueFromObject(autoscaleConfig, 'autoscaler.vertical.tiers');
+    const maxNodesPerTier = parseInt(getValueFromObject(autoscaleConfig, 'autoscaler.vertical.maxNodesPerTier'), 10);
+
+    if (!isVerticalEnabled) {
+        return { ...tiers[0], tierIndex: 0 };
+    }
+
+    const regionalServers = activeClusterServers.filter(s => s.region === targetRegion || s.location.region === targetRegion);
+
+    if (regionalServers.length === 0) {
+        return { ...tiers[0], tierIndex: 0 };
+    }
+
+    let currentTierIndex = 0;
+    let nodesAtCurrentTier = 0;
+
+    for (const serverNode of regionalServers) {
+        const nodeCpu = serverNode.vCPU;
+        const nodeMem = serverNode.memoryGb;
+
+        const matchedIndex = tiers.findIndex(t => t.vCPU === nodeCpu && t.memoryGb === nodeMem);
+        if (matchedIndex > currentTierIndex) {
+            currentTierIndex = matchedIndex;
+            nodesAtCurrentTier = 1;
+        } else if (matchedIndex === currentTierIndex) {
+            nodesAtCurrentTier++;
+        }
+    }
+
+    if (nodesAtCurrentTier < maxNodesPerTier) {
+        return { ...tiers[currentTierIndex], tierIndex: currentTierIndex };
+    }
+
+    const nextTierIndex = Math.min(currentTierIndex + 1, tiers.length - 1);
+    console.log(`[@cocreate/server-autoscaler] [VERTICAL TIERING] Region [${targetRegion}] reached ${nodesAtCurrentTier}/${maxNodesPerTier} nodes at tier ${currentTierIndex}. Stepping up to tier ${nextTierIndex} (${tiers[nextTierIndex].vCPU} vCPU, ${tiers[nextTierIndex].memoryGb}GB RAM).`);
+
+    return { ...tiers[nextTierIndex], tierIndex: nextTierIndex };
+}
+
+/**
+ * Searches the provider's `instances` array (returned by geoScaling) for an instance name
+ * that best matches or satisfies the target tier's vCPU and memory specifications.
+ * 
+ * @param {Array<Object>} instances - Instance catalog array from cloud provider config
+ * @param {Object} targetTier - Target tier specifications { vCPU, memoryGb }
+ * @returns {string} Matching instance type string (e.g. 't3a.medium', 'e2-standard-4')
+ */
+function selectInstanceType(instances, targetTier) {
+    const requiredCpu = targetTier.vCPU;
+    const requiredMem = targetTier.memoryGb;
+
+    const exactMatch = instances.find(inst => inst.vCPU === requiredCpu && inst.memoryGb === requiredMem);
+    if (exactMatch) {
+        return exactMatch.name;
+    }
+
+    const suitable = instances
+        .filter(inst => inst.vCPU >= requiredCpu && inst.memoryGb >= requiredMem)
+        .sort((a, b) => (a.vCPU - b.vCPU) || (a.memoryGb - b.memoryGb));
+
+    if (suitable.length > 0) {
+        return suitable[0].name;
+    }
+
+    return instances[instances.length - 1].name;
+}
+
+/**
+ * Calculates full scale-out details without provisioning:
+ * 1. Invokes getCloudProvider() to obtain target cloud provider, region, and instance catalog.
+ * 2. Queries active cluster state from DB to evaluate current nodes in that region.
+ * 3. Evaluates vertical tier rules from autoscaleConfig to pick target vCPU / memory tier.
+ * 4. Matches the required tier against the provider's instances array to determine the instanceType name.
+ * 
+ * @param {Array<Object>} clientLocations - Active client traffic distribution points
+ * @returns {Promise<Object>} Complete scale-out recommendation object
+ */
+export async function determineScaleOutTarget(clientLocations) {
+    if (!autoscaleConfig) await loadAutoscaleConfig();
+
+    const isGeoEnabled = getValueFromObject(autoscaleConfig, 'autoscaler.geoScale.enabled');
+    const sheddingThreshold = getValueFromObject(autoscaleConfig, 'autoscaler.geoScale.sheddingThreshold');
+    const preferredProviders = getValueFromObject(autoscaleConfig, 'autoscaler.preferredProviders');
+
+    const geoTarget = await getCloudProvider(clientLocations, {
+        geoScaleByContinent: isGeoEnabled,
+        sheddingThreshold,
+        preferredProviders,
+        autoscaleConfig
+    }, server);
+
+    const cloudRegion = geoTarget.nearestCloudRegion;
+    const provider = cloudRegion.provider;
+    const region = cloudRegion.region;
+    const providerInstances = cloudRegion.instances;
+    const providerEndpoints = cloudRegion.endpoints;
+
+    const clusterData = await getClusterDetails();
+    const activeServers = clusterData.servers;
+
+    const targetTier = determineTargetTier(region, activeServers);
+    const instanceType = selectInstanceType(providerInstances, targetTier);
+
+    const result = {
+        provider,
+        region,
+        instanceType,
+        targetTier,
+        endpoints: providerEndpoints,
+        createInstanceEndpoint: providerEndpoints.createInstance,
+        deleteInstanceEndpoint: providerEndpoints.deleteInstance,
+        datacenterName: cloudRegion.datacenterName,
+        countryCode: cloudRegion.countryCode,
+        coordinates: cloudRegion.coordinates,
+        distanceKm: cloudRegion.distanceKm,
+        geoScaleByContinent: geoTarget.geoScaleByContinent,
+        targetContinent: geoTarget.targetContinent,
+        isSheddingTarget: geoTarget.isSheddingTarget,
+        targetPercentage: geoTarget.targetPercentage,
+        totalActiveClients: geoTarget.totalActiveClients,
+        timestamp: Date.now()
+    };
+
+    console.log("[@cocreate/server-autoscaler] Resolved complete scale-out decision:", JSON.stringify(result, null, 2));
+    return result;
+}
+
+/**
+ * Triggers horizontal scale-out provisioning workflow:
+ * 1. Computes optimal cloud provider, region, and instance tier using determineScaleOutTarget.
+ * 2. Dispatches instance creation API call via server.api.send.
+ * 
+ * @param {Array<Object>} clientLocations - Active client traffic location points
+ * @returns {Promise<Object>} API execution result payload
+ */
+export async function scaleOut(clientLocations) {
+    const target = await determineScaleOutTarget(clientLocations);
+    const endpoint = target.createInstanceEndpoint;
+
+    console.log(`[@cocreate/server-autoscaler] [SCALE-OUT] Sending instance creation API request for provider [${target.provider}] on endpoint [${endpoint}] in region [${target.region}]...`);
+
+    const apiPayload = {
+        method: `${target.provider}.createInstance`,
+        endpoint,
+        organization_id: server.organization_id,
+        host: server.host,
+        data: {
+            provider: target.provider,
+            region: target.region,
+            instanceType: target.instanceType,
+            vCPU: target.targetTier.vCPU,
+            memoryGb: target.targetTier.memoryGb,
+            datacenterName: target.datacenterName,
+            countryCode: target.countryCode,
+            cluster_id: server.cluster_id
+        }
+    };
+
+    const response = await server.api.send(apiPayload);
+    console.log("[@cocreate/server-autoscaler] [SCALE-OUT] API response received:", response);
+    return response;
+}
+
+/**
+ * Evaluates active cluster servers against autoscale scale-in policies to determine
+ * which server candidate should be decommissioned (dry-run preview).
+ * 
+ * @param {Object} options - Optional override parameters
+ * @returns {Promise<Object>} Evaluation result containing selected candidate server and reason
+ */
+export async function determineScaleInTarget(options) {
+    if (!autoscaleConfig) await loadAutoscaleConfig();
+
+    const minSize = getValueFromObject(autoscaleConfig, 'autoscaler.scaleIn.minClusterSize');
+    const strategy = getValueFromObject(autoscaleConfig, 'autoscaler.scaleIn.decommissionStrategy');
+
+    const clusterData = await getClusterDetails();
+    const activeServers = clusterData.servers;
+
+    if (activeServers.length <= minSize) {
+        console.log(`[@cocreate/server-autoscaler] [SCALE-IN PREVIEW] Cannot scale in: Active nodes (${activeServers.length}) is at or below cluster floor (${minSize}).`);
+        return {
+            canScaleIn: false,
+            reason: `Cluster size (${activeServers.length}) is at or below minimum floor (${minSize}).`,
+            candidateServer: null,
+            activeCount: activeServers.length,
+            minClusterSize: minSize
+        };
+    }
+
+    let candidateServer = null;
+
+    if (strategy === "idle") {
+        candidateServer = [...activeServers].sort((a, b) => {
+            const loadA = a.telemetry.cpu.totalUsage + a.telemetry.memory.percentage;
+            const loadB = b.telemetry.cpu.totalUsage + b.telemetry.memory.percentage;
+            return loadA - loadB;
+        })[0];
+    } else {
+        candidateServer = activeServers[activeServers.length - 1];
+    }
+
+    return {
+        canScaleIn: true,
+        reason: `Candidate node selected using strategy '${strategy}'.`,
+        candidateServer,
+        activeCount: activeServers.length,
+        minClusterSize: minSize,
+        decommissionStrategy: strategy
+    };
+}
+
+/**
+ * Triggers horizontal scale-in decommissioning workflow:
+ * 1. Resolves target server candidate to scale in using determineScaleInTarget.
+ * 2. Dispatches instance termination API call via server.api.send.
+ * 
+ * @param {Object} targetServer - Optional target server document to decommission
+ * @returns {Promise<Object>} API execution result payload
+ */
+export async function scaleIn(targetServer) {
+    let candidateServer = targetServer;
+
+    if (!candidateServer) {
+        const scaleInTarget = await determineScaleInTarget();
+        candidateServer = scaleInTarget.candidateServer;
+    }
+
+    const provider = candidateServer.provider;
+    const instanceId = candidateServer.instanceId;
+
+    const configuredEndpoint = candidateServer.endpoints.deleteInstance;
+    const endpoint = configuredEndpoint.includes(':id') 
+        ? configuredEndpoint.replace(':id', instanceId)
+        : `${configuredEndpoint}/${instanceId}`;
+
+    console.log(`[@cocreate/server-autoscaler] [SCALE-IN] Sending instance termination API request for provider [${provider}] on endpoint [${endpoint}] for node [${instanceId}]...`);
+
+    const apiPayload = {
+        method: `${provider}.deleteInstance`,
+        endpoint,
+        organization_id: server.organization_id,
+        host: server.host,
+        data: {
+            serverId: candidateServer._id,
+            instanceId: instanceId,
+            provider: provider,
+            region: candidateServer.region
+        }
+    };
+
+    const response = await server.api.send(apiPayload);
+    console.log("[@cocreate/server-autoscaler] [SCALE-IN] API response received:", response);
+    return response;
+}
+
+function createAutoscalerApi() {
+    return {
+        scaleOut,
+        determineScaleOutTarget,
+        scaleIn,
+        determineScaleInTarget
+    };
+}
+
+export async function init(serverInstance) {
+    const api = createAutoscalerApi();
+
+    if (!isMaster) {
+        return api;
+    }
+
+    server = serverInstance;
+    console.log("[@cocreate/server-autoscaler] Initializing Autoscaler service...");
+
+    isRunning = true;
+    console.log("[@cocreate/server-autoscaler] Autoscaler service initialized successfully.");
+
+    return api;
+}
+
+export default {
+    init
 };

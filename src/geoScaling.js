@@ -1,4 +1,108 @@
-import { getValueFromObject, cloudProviders } from '@cocreate/utils';
+/********************************************************************************
+ * Copyright (C) 2026 CoCreate and Contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ ********************************************************************************/
+
+import Config from '@cocreate/config';
+import { getValueFromObject } from '@cocreate/utils';
+
+/**
+ * Reads cloud provider configurations from the provided autoscaler config object,
+ * or queries the database for active autoscaler configuration (type: 'autoscaler')
+ * containing the `clouds` array key. Flattens configured regions into standardized
+ * datacenter region objects with attached instance catalogs.
+ * 
+ * @param {Object|Array} [autoscaleConfigOrClouds] - Resolved autoscale config object or clouds array
+ * @param {Object} [server] - Optional CoCreate server instance for database targeting
+ * @returns {Promise<Array<Object>>} Standardized datacenter regions array with instances catalog
+ */
+export async function loadCloudProviders(autoscaleConfigOrClouds = null, server = null) {
+    try {
+        let cloudDocs = [];
+
+        if (Array.isArray(autoscaleConfigOrClouds)) {
+            cloudDocs = autoscaleConfigOrClouds;
+        } else if (autoscaleConfigOrClouds && typeof autoscaleConfigOrClouds === 'object') {
+            const clouds = getValueFromObject(autoscaleConfigOrClouds, 'autoscaler.clouds') || 
+                           autoscaleConfigOrClouds.clouds || 
+                           autoscaleConfigOrClouds.cloud || [];
+            cloudDocs = Array.isArray(clouds) ? clouds : [clouds];
+        } else {
+            const config = new Config();
+            const query = {
+                type: 'autoscaler'
+            };
+
+            if (server?.organization_id) query.organization_id = server.organization_id;
+            if (server?.host) query.server = server.host;
+            if (server?.cluster_id) query.cluster = server.cluster_id;
+
+            console.log("[@cocreate/server-autoscaler] Querying database for autoscaler config containing clouds via config.query...");
+            const result = await config.query(query);
+
+            let autoscalerDoc = null;
+            if (Array.isArray(result)) {
+                autoscalerDoc = result[0];
+            } else if (result && typeof result === 'object') {
+                autoscalerDoc = result.type === 'autoscaler' ? result : Object.values(result).find(doc => doc?.type === 'autoscaler');
+            }
+
+            if (autoscalerDoc) {
+                const clouds = getValueFromObject(autoscalerDoc, 'autoscaler.clouds') || 
+                               autoscalerDoc.clouds || 
+                               autoscalerDoc.cloud || [];
+                cloudDocs = Array.isArray(clouds) ? clouds : [clouds];
+            }
+        }
+
+        const flattenedRegions = [];
+
+        for (const cloudDoc of cloudDocs) {
+            if (!cloudDoc || cloudDoc.enabled === false) continue;
+
+            const providerKey = cloudDoc.provider || cloudDoc.name || 'unknown';
+            const regions = cloudDoc.config?.regions || cloudDoc.regions;
+            const instances = cloudDoc.config?.instances || cloudDoc.instances || [];
+            const endpoints = cloudDoc.config?.endpoints || cloudDoc.endpoints || {};
+
+            if (Array.isArray(regions)) {
+                for (const reg of regions) {
+                    if (reg && typeof reg.lat === 'number' && typeof reg.lng === 'number') {
+                        flattenedRegions.push({
+                            provider: providerKey,
+                            region: reg.region,
+                            datacenterName: reg.name,
+                            countryCode: reg.country,
+                            lat: reg.lat,
+                            lng: reg.lng,
+                            instances: Array.isArray(instances) ? instances : [],
+                            endpoints: typeof endpoints === 'object' ? endpoints : {}
+                        });
+                    }
+                }
+            }
+        }
+
+        console.log(`[@cocreate/server-autoscaler] Resolved ${flattenedRegions.length} active datacenter regions across ${cloudDocs.length} cloud provider definitions from autoscaler config.`);
+        return flattenedRegions;
+    } catch (err) {
+        console.error("[@cocreate/server-autoscaler] Error resolving cloud providers from autoscaler config:", err.message);
+        return [];
+    }
+}
 
 /**
  * Calculates Great-Circle distance between two coordinates using Haversine formula (returns KM).
@@ -24,24 +128,30 @@ export function calculateHaversineDistance(latitude1, longitude1, latitude2, lon
 }
 
 /**
- * Finds the nearest cloud datacenter region across all providers (or an allowed subset)
- * to a target latitude/longitude centroid.
+ * Finds the nearest cloud datacenter region across active cloud providers
+ * to a target latitude/longitude centroid, returning region metadata and instance catalog.
  * 
  * @param {number} targetLatitude - Target Latitude centroid
  * @param {number} targetLongitude - Target Longitude centroid
- * @param {Object} [options] - Optional filters (e.g. preferred providers)
- * @returns {Object|null} Recommended provider region metadata and distance in KM
+ * @param {Object} [options] - Optional filters (e.g. preferred providers, autoscaleConfig)
+ * @param {Object} [server] - Optional server context
+ * @returns {Promise<Object|null>} Recommended provider region metadata, distance in KM, and instances array
  */
-export function findNearestCloudRegion(targetLatitude, targetLongitude, options = {}) {
+export async function findNearestCloudRegion(targetLatitude, targetLongitude, options = {}, server = null) {
     if (typeof targetLatitude !== 'number' || typeof targetLongitude !== 'number') {
         return null;
+    }
+
+    let locations = options.cloudProviders || options.cloudProvidersList;
+    if (!locations || locations.length === 0) {
+        locations = await loadCloudProviders(options.autoscaleConfig || options.clouds || server, server);
     }
 
     const allowedProviders = options.providers ? options.providers.map(p => String(p).toLowerCase()) : null;
     let nearestMatch = null;
     let minDistance = Infinity;
 
-    for (const loc of cloudProviders) {
+    for (const loc of locations) {
         if (allowedProviders && !allowedProviders.includes(loc.provider.toLowerCase())) {
             continue;
         }
@@ -52,10 +162,12 @@ export function findNearestCloudRegion(targetLatitude, targetLongitude, options 
             nearestMatch = {
                 provider: loc.provider,
                 region: loc.region,
-                datacenterName: loc.name,
-                countryCode: loc.country,
+                datacenterName: loc.datacenterName || loc.name,
+                countryCode: loc.countryCode || loc.country,
                 coordinates: { latitude: loc.lat, longitude: loc.lng },
-                distanceKm: Math.round(distance)
+                distanceKm: Math.round(distance),
+                instances: loc.instances || [],
+                endpoints: loc.endpoints || {}
             };
         }
     }
@@ -116,31 +228,38 @@ export function calculateWeightedCentroid(clients) {
 /**
  * Primary entry point: Calculates optimal cloud provider target and datacenter location.
  * Implements optional continent-based load shedding and fallback behavior.
+ * Returns provider name, region name, and provider's defined instances catalog.
  * 
  * @param {Array<Object>} clients - Active client instances or location distribution map
  * @param {Object} [options] - Configuration options
  * @param {boolean} [options.geoScaleByContinent=false] - If true, isolates centroid calculation to specific continent thresholds
  * @param {Array<Object>} [options.existingNodes] - Array of already active node regions (e.g. [{ continent: 'EU' }])
- * @param {number} [options.sheddingThreshold=0] - Required traffic percentage in an unserved region to trigger shedding (e.g. 20 for 20%)
- * @returns {Object|null} Complete recommended target metadata
+ * @param {number} [options.sheddingThreshold=0] - Required traffic percentage in an unserved region to trigger shedding
+ * @param {Object} [server] - Optional CoCreate server instance
+ * @returns {Promise<Object|null>} Complete recommended target metadata containing cloud provider, region, and instances catalog
  */
-export function getCloudProvider(clients, options = {}) {
+export async function getCloudProvider(clients, options = {}, server = null) {
     if (!clients || clients.length === 0) {
         console.log("[@cocreate/server-autoscaler] [GEO-SCALING] No active client location data provided. Defaulting to provider default region.");
         return null;
     }
 
+    // Load active cloud providers from autoscaleConfig or options
+    const locations = options.cloudProviders || await loadCloudProviders(options.autoscaleConfig || options.clouds, server);
+
     const preferredProviders = options.preferredProviders || 
-        (options.autoscaleConfig ? getValueFromObject(options.autoscaleConfig, 'autoscale.preferredProviders') : null);
+        (options.autoscaleConfig ? getValueFromObject(options.autoscaleConfig, 'autoscaler.preferredProviders') : null);
 
     const totalActiveClients = clients.reduce((sum, item) => sum + (item.count || 1), 0);
 
     // 1. GLOBAL SCALING MODE (Default behavior if continent scaling is disabled)
     if (!options.geoScaleByContinent) {
         const globalCentroid = calculateWeightedCentroid(clients);
-        const nearestCloud = globalCentroid ? findNearestCloudRegion(globalCentroid.latitude, globalCentroid.longitude, {
-            providers: preferredProviders
-        }) : null;
+        const nearestCloud = globalCentroid ? await findNearestCloudRegion(globalCentroid.latitude, globalCentroid.longitude, {
+            providers: preferredProviders,
+            cloudProviders: locations,
+            autoscaleConfig: options.autoscaleConfig
+        }, server) : null;
 
         return {
             geoScaleByContinent: false,
@@ -169,7 +288,7 @@ export function getCloudProvider(clients, options = {}) {
 
     const existingNodes = options.existingNodes || [];
     const activeContinents = existingNodes.map(node => node.continent);
-    const sheddingThresholdPct = options.sheddingThreshold || 0; // Default to 0% (any traffic triggers shedding)
+    const sheddingThresholdPct = options.sheddingThreshold || 0;
 
     let targetContinentData = null;
     let isSheddingTarget = false;
@@ -198,9 +317,11 @@ export function getCloudProvider(clients, options = {}) {
     let nearestCloud = null;
 
     if (regionalCentroid) {
-        nearestCloud = findNearestCloudRegion(regionalCentroid.latitude, regionalCentroid.longitude, {
-            providers: preferredProviders
-        });
+        nearestCloud = await findNearestCloudRegion(regionalCentroid.latitude, regionalCentroid.longitude, {
+            providers: preferredProviders,
+            cloudProviders: locations,
+            autoscaleConfig: options.autoscaleConfig
+        }, server);
     }
 
     return {
