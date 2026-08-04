@@ -1,6 +1,6 @@
 {
   "name": "@cocreate/server-autoscaler",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Decentralized, masterless P2P autoscaling engine for CoCreate Server. Executes autonomous horizontal and vertical multi-cloud adjustments driven by real-time tenant telemetry.",
   "keywords": [
     "cocreate",
