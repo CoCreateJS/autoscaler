@@ -22,7 +22,7 @@ import { getValueFromObject, dotNotationToObject } from '@cocreate/utils';
 import { getCloudProvider } from './geoScaling.js';
 
 // Guard clause verification to ensure cluster API abstraction integrity
-const isPrimary = cluster.isPrimary || cluster.isMaster;
+const isPrimary = cluster.isPrimary;
 
 let server = null;
 
