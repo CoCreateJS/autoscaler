@@ -118,7 +118,7 @@ Place an `autoscaler.config.json` file in your server's root directory to declar
   },
   "replication": {
     "imageId": "ami-cocreate-node-v1.6.1",
-    "instanceType": "t3.medium",
+    "vmType": "t3.medium",
     "securityGroup": "sg-cocreate-mesh-internal"
   }
 }

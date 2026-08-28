@@ -22,7 +22,7 @@ import { getValueFromObject, dotNotationToObject } from '@cocreate/utils';
 import { getCloudProvider } from './geoScaling.js';
 
 // Guard clause verification to ensure cluster API abstraction integrity
-const isMaster = cluster.isMaster;
+const isPrimary = cluster.isPrimary || cluster.isMaster;
 
 let server = null;
 
@@ -216,14 +216,11 @@ function selectInstanceType(instances = [], targetTier) {
 }
 
 /**
- * Calculates full scale-out details without provisioning:
- * 1. Invokes getCloudProvider() with autoscaleConfig passed directly.
- * 2. Queries active cluster state from DB to evaluate current nodes in that region.
- * 3. Evaluates vertical tier rules from autoscaleConfig to pick target vCPU / memory tier.
- * 4. Matches the required tier against the provider's instances array to determine the instanceType name.
+ * Calculates scale-out targeting details: provider, region, instanceType, vCPU, memoryGb,
+ * datacenterName, countryCode, and geo latency metadata based on client traffic distribution.
  * 
  * @param {Array<Object>} clientLocations - Active client traffic distribution points
- * @returns {Promise<Object>} Complete scale-out recommendation object
+ * @returns {Promise<Object>} Target specification object calculated for scale-out
  */
 export async function determineScaleOutTarget(clientLocations) {
     if (!autoscaleConfig) await loadAutoscaleConfig();
@@ -243,7 +240,6 @@ export async function determineScaleOutTarget(clientLocations) {
     const provider = cloudRegion.provider;
     const region = cloudRegion.region;
     const providerInstances = cloudRegion.instances;
-    const providerEndpoints = cloudRegion.endpoints;
 
     const clusterData = await getClusterDetails();
     const activeServers = clusterData.servers;
@@ -255,10 +251,9 @@ export async function determineScaleOutTarget(clientLocations) {
         provider,
         region,
         instanceType,
+        vCPU: targetTier.vCPU,
+        memoryGb: targetTier.memoryGb,
         targetTier,
-        endpoints: providerEndpoints,
-        createInstanceEndpoint: providerEndpoints.createInstance,
-        deleteInstanceEndpoint: providerEndpoints.deleteInstance,
         datacenterName: cloudRegion.datacenterName,
         countryCode: cloudRegion.countryCode,
         coordinates: cloudRegion.coordinates,
@@ -271,38 +266,52 @@ export async function determineScaleOutTarget(clientLocations) {
         timestamp: Date.now()
     };
 
-    console.log("[@cocreate/server-autoscaler] Resolved complete scale-out decision:", JSON.stringify(result, null, 2));
+    console.log("[@cocreate/server-autoscaler] Resolved scale-out target decision:", JSON.stringify(result, null, 2));
     return result;
 }
 
 /**
  * Triggers horizontal scale-out provisioning workflow:
- * 1. Computes optimal cloud provider, region, and instance tier using determineScaleOutTarget.
- * 2. Dispatches instance creation API call via server.api.send.
+ * 1. Computes optimal cloud provider, region, instance type, vCPU, memory, datacenter, and country code via determineScaleOutTarget.
+ * 2. Fetches static configurations (spot, startupScript, os, application, create endpoint) directly from autoscaleConfig.
+ * 3. Dispatches instance creation API call via server.api.send.
  * 
  * @param {Array<Object>} clientLocations - Active client traffic location points
  * @returns {Promise<Object>} API execution result payload
  */
 export async function scaleOut(clientLocations) {
-    const target = await determineScaleOutTarget(clientLocations);
-    const endpoint = target.createInstanceEndpoint;
+    if (!autoscaleConfig) await loadAutoscaleConfig();
 
-    console.log(`[@cocreate/server-autoscaler] [SCALE-OUT] Sending instance creation API request for provider [${target.provider}] on endpoint [${endpoint}] in region [${target.region}]...`);
+    const target = await determineScaleOutTarget(clientLocations);
+    const provider = target.provider;
+
+    // Retrieve static provisioning configurations directly from autoscaleConfig
+    const spot = getValueFromObject(autoscaleConfig, 'spot');
+    const startupScript = getValueFromObject(autoscaleConfig, `clouds.${provider}.startupScript`) || getValueFromObject(autoscaleConfig, 'startupScript');
+    const os = getValueFromObject(autoscaleConfig, `clouds.${provider}.os`) || getValueFromObject(autoscaleConfig, 'os');
+    const application = getValueFromObject(autoscaleConfig, `clouds.${provider}.application`) || getValueFromObject(autoscaleConfig, 'application');
+    const endpoint = getValueFromObject(autoscaleConfig, `clouds.${provider}.endpoint.create`);
+
+    console.log(`[@cocreate/server-autoscaler] [SCALE-OUT] Sending instance creation API request for provider [${provider}] on endpoint [${endpoint}] in region [${target.region}]...`);
 
     const apiPayload = {
-        method: `${target.provider}.createInstance`,
+        method: provider,
         endpoint,
         organization_id: server.organization_id,
         host: server.host,
-        data: {
+        [provider]: {
             provider: target.provider,
             region: target.region,
             instanceType: target.instanceType,
-            vCPU: target.targetTier.vCPU,
-            memoryGb: target.targetTier.memoryGb,
+            vCPU: target.vCPU,
+            memoryGb: target.memoryGb,
             datacenterName: target.datacenterName,
             countryCode: target.countryCode,
-            cluster_id: server.cluster_id
+            cluster_id: server.cluster_id,
+            spot,
+            startupScript,
+            os,
+            application
         }
     };
 
@@ -382,23 +391,21 @@ export async function scaleIn(targetServer) {
     }
 
     const provider = candidateServer.provider;
-    const instanceId = candidateServer.instanceId;
+    const vmId = candidateServer.vmId;
 
-    const configuredEndpoint = candidateServer.endpoints?.deleteInstance || '';
-    const endpoint = configuredEndpoint.includes(':id') 
-        ? configuredEndpoint.replace(':id', instanceId)
-        : `${configuredEndpoint}/${instanceId}`;
+    // Retrieve delete endpoint directly from autoscaleConfig
+    const endpoint = getValueFromObject(autoscaleConfig, `clouds.${provider}.endpoint.delete`);
 
-    console.log(`[@cocreate/server-autoscaler] [SCALE-IN] Sending instance termination API request for provider [${provider}] on endpoint [${endpoint}] for node [${instanceId}]...`);
+    console.log(`[@cocreate/server-autoscaler] [SCALE-IN] Sending instance termination API request for provider [${provider}] on endpoint [${endpoint}] for node [${vmId}]...`);
 
     const apiPayload = {
-        method: `${provider}.deleteInstance`,
+        method: provider,
         endpoint,
         organization_id: server.organization_id,
         host: server.host,
-        data: {
+        [provider]: {
             serverId: candidateServer._id,
-            instanceId: instanceId,
+            vmId: vmId,
             provider: provider,
             region: candidateServer.region
         }
@@ -410,7 +417,7 @@ export async function scaleIn(targetServer) {
 }
 
 export async function init(serverInstance) {
-    if (!isMaster) {
+    if (!isPrimary) {
         return;
     }
 
