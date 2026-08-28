@@ -1,45 +1,46 @@
 {
-  "name": "@cocreate/server-autoscaler",
-  "version": "1.4.0",
-  "description": "Decentralized, masterless P2P autoscaling engine for CoCreate Server. Executes autonomous horizontal and vertical multi-cloud adjustments driven by real-time tenant telemetry.",
-  "keywords": [
-    "cocreate",
-    "cocreate-server",
-    "autoscaler",
-    "cluster-orchestration",
-    "p2p-replication",
-    "decentralized-scaling",
-    "cloud-native",
-    "self-healing",
-    "cooperative-draining",
-    "multi-cloud-adapter",
-    "telemetry-driven"
-  ],
-  "publishConfig": {
-    "access": "public"
-  },
-  "scripts": {
-    "start": "webpack --config webpack.config.js",
-    "build": "webpack --mode=production --config webpack.config.js",
-    "dev": "webpack --config webpack.config.js --watch"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/CoCreate-app/CoCreate-server-autoscaler.git"
-  },
-  "author": "CoCreate LLC",
-  "license": "AGPL-3.0",
-  "bugs": {
-    "url": "https://github.com/CoCreate-app/CoCreate-server-autoscaler/issues"
-  },
-  "homepage": "https://cocreate.app/docs/server-autoscaler",
-  "funding": {
-    "type": "GitHub Sponsors ❤",
-    "url": "https://github.com/sponsors/CoCreate-app"
-  },
-  "type": "module",
-  "main": "./src/index.js",
-  "dependencies": {
-    "@cocreate/config": "^1.19.0"
-  }
+    "name": "@cocreate/server-autoscaler",
+    "version": "1.4.0",
+    "description": "Decentralized, masterless P2P autoscaling engine for CoCreate Server. Executes autonomous horizontal and vertical multi-cloud adjustments driven by real-time tenant telemetry.",
+    "keywords": [
+        "cocreate",
+        "cocreate-server",
+        "autoscaler",
+        "cluster-orchestration",
+        "p2p-replication",
+        "decentralized-scaling",
+        "cloud-native",
+        "self-healing",
+        "cooperative-draining",
+        "multi-cloud-adapter",
+        "telemetry-driven"
+    ],
+    "publishConfig": {
+        "access": "public"
+    },
+    "scripts": {
+        "start": "webpack --config webpack.config.js",
+        "build": "webpack --mode=production --config webpack.config.js",
+        "dev": "webpack --config webpack.config.js --watch"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/CoCreate-app/CoCreate-server-autoscaler.git"
+    },
+    "author": "CoCreate LLC",
+    "license": "AGPL-3.0",
+    "bugs": {
+        "url": "https://github.com/CoCreate-app/CoCreate-server-autoscaler/issues"
+    },
+    "homepage": "https://cocreate.app/docs/server-autoscaler",
+    "funding": {
+        "type": "GitHub Sponsors ❤",
+        "url": "https://github.com/sponsors/CoCreate-app"
+    },
+    "type": "module",
+    "main": "./src/index.js",
+    "dependencies": {
+        "@cocreate/config": "^1.19.0",
+        "@cocreate/utils": "^1.52.0"
+    }
 }
