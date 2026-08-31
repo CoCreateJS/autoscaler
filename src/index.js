@@ -105,7 +105,7 @@ async function getClusterDetails(query = {}) {
     const readResponse = await server.crud.send({
         method: 'object.read',
         array: 'servers',
-        $filter: {
+        filter: {
             query: {
                 'master.status': 'running',
                 ...query
