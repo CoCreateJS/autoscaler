@@ -50,15 +50,8 @@ let autoscaleConfig = {
     vertical: {
         enabled: true,
         maxNodesPerTier: 2,
-        tiers: [
-            { vCPU: 1, memoryGb: 2 },
-            { vCPU: 2, memoryGb: 8 },
-            { vCPU: 4, memoryGb: 16 },
-            { vCPU: 8, memoryGb: 32 },
-            { vCPU: 16, memoryGb: 64 },
-            { vCPU: 32, memoryGb: 128 },
-            { vCPU: 64, memoryGb: 256 }
-        ]
+        min: { vCPU: 1, memoryGb: 2 },
+        max: { vCPU: 64, memoryGb: 256 }
     }
 };
 
@@ -139,8 +132,9 @@ async function getClusterDetails(query = {}) {
 }
 
 /**
- * Evaluates the vertical tiering policy and determines the target tier requirements
- * (vCPU and Memory) for scaling in a given region based on current active nodes in that region.
+ * Evaluates the vertical tiering policy and determines the target resource requirements
+ * for scaling out in a region. After maxNodesPerTier nodes exist at the current size,
+ * the next size doubles vCPU and memory without exceeding the configured maximum.
  * 
  * @param {string} targetRegion - Target region identifier (e.g. 'us-east-1')
  * @param {Array<Object>} activeClusterServers - Active servers running in cluster
@@ -148,43 +142,88 @@ async function getClusterDetails(query = {}) {
  */
 function determineTargetTier(targetRegion, activeClusterServers) {
     const isVerticalEnabled = getValueFromObject(autoscaleConfig, 'vertical.enabled');
-    const tiers = getValueFromObject(autoscaleConfig, 'vertical.tiers');
-    const maxNodesPerTier = parseInt(getValueFromObject(autoscaleConfig, 'vertical.maxNodesPerTier'), 10);
+    const minimum = getValueFromObject(autoscaleConfig, 'vertical.min') || {};
+    const maximum = getValueFromObject(autoscaleConfig, 'vertical.max') || {};
+    const minTier = {
+        vCPU: Math.max(1, Number(minimum.vCPU) || 1),
+        memoryGb: Math.max(1, Number(minimum.memoryGb) || 2)
+    };
+    const maxTier = {
+        vCPU: Math.max(minTier.vCPU, Number(maximum.vCPU) || 64),
+        memoryGb: Math.max(minTier.memoryGb, Number(maximum.memoryGb) || 256)
+    };
+    const maxNodesPerTier = Math.max(
+        1,
+        parseInt(getValueFromObject(autoscaleConfig, 'vertical.maxNodesPerTier'), 10) || 2
+    );
 
     if (!isVerticalEnabled) {
-        return { ...tiers[0], tierIndex: 0 };
+        return { ...minTier, tierIndex: 0 };
     }
 
-    const regionalServers = activeClusterServers.filter(s => s.region === targetRegion || s.location?.region === targetRegion);
+    const regionalServers = activeClusterServers.filter((serverNode) =>
+        serverNode.region === targetRegion ||
+        serverNode.infrastructure?.region === targetRegion ||
+        serverNode.location?.region === targetRegion
+    );
 
     if (regionalServers.length === 0) {
-        return { ...tiers[0], tierIndex: 0 };
+        return { ...minTier, tierIndex: 0 };
     }
 
-    let currentTierIndex = 0;
-    let nodesAtCurrentTier = 0;
+    const nodeTiers = regionalServers.map((serverNode) => {
+        const infrastructure = serverNode.infrastructure || {};
+        const provider = serverNode.provider || infrastructure.provider;
+        const instanceType = serverNode.instanceType || serverNode.vmType || infrastructure.vmType;
+        const providerInstances = getValueFromObject(
+            autoscaleConfig,
+            `clouds.${provider}.instances`
+        ) || [];
+        const instance = providerInstances.find(({ name }) => name === instanceType);
 
-    for (const serverNode of regionalServers) {
-        const nodeCpu = serverNode.vCPU;
-        const nodeMem = serverNode.memoryGb;
-
-        const matchedIndex = tiers.findIndex(t => t.vCPU === nodeCpu && t.memoryGb === nodeMem);
-        if (matchedIndex > currentTierIndex) {
-            currentTierIndex = matchedIndex;
-            nodesAtCurrentTier = 1;
-        } else if (matchedIndex === currentTierIndex) {
-            nodesAtCurrentTier++;
-        }
-    }
+        return {
+            vCPU: Math.min(
+                maxTier.vCPU,
+                Math.max(
+                    minTier.vCPU,
+                    Number(serverNode.vCPU || infrastructure.vCPU || instance?.vCPU) || minTier.vCPU
+                )
+            ),
+            memoryGb: Math.min(
+                maxTier.memoryGb,
+                Math.max(
+                    minTier.memoryGb,
+                    Number(serverNode.memoryGb || infrastructure.memoryGb || instance?.memoryGb) || minTier.memoryGb
+                )
+            )
+        };
+    });
+    const currentTier = [...nodeTiers].sort((a, b) =>
+        b.vCPU - a.vCPU || b.memoryGb - a.memoryGb
+    )[0];
+    const nodesAtCurrentTier = nodeTiers.filter(({ vCPU, memoryGb }) =>
+        vCPU === currentTier.vCPU && memoryGb === currentTier.memoryGb
+    ).length;
+    const currentTierIndex = Math.max(
+        Math.ceil(Math.log2(currentTier.vCPU / minTier.vCPU)),
+        Math.ceil(Math.log2(currentTier.memoryGb / minTier.memoryGb)),
+        0
+    );
 
     if (nodesAtCurrentTier < maxNodesPerTier) {
-        return { ...tiers[currentTierIndex], tierIndex: currentTierIndex };
+        return { ...currentTier, tierIndex: currentTierIndex };
     }
 
-    const nextTierIndex = Math.min(currentTierIndex + 1, tiers.length - 1);
-    console.log(`[@cocreate/server-autoscaler] [VERTICAL TIERING] Region [${targetRegion}] reached ${nodesAtCurrentTier}/${maxNodesPerTier} nodes at tier ${currentTierIndex}. Stepping up to tier ${nextTierIndex} (${tiers[nextTierIndex].vCPU} vCPU, ${tiers[nextTierIndex].memoryGb}GB RAM).`);
+    const nextTier = {
+        vCPU: Math.min(maxTier.vCPU, currentTier.vCPU * 2),
+        memoryGb: Math.min(maxTier.memoryGb, currentTier.memoryGb * 2)
+    };
+    const nextTierIndex = currentTierIndex + (
+        nextTier.vCPU !== currentTier.vCPU || nextTier.memoryGb !== currentTier.memoryGb ? 1 : 0
+    );
+    console.log(`[@cocreate/server-autoscaler] [VERTICAL TIERING] Region [${targetRegion}] reached ${nodesAtCurrentTier}/${maxNodesPerTier} nodes at tier ${currentTierIndex}. Stepping up to tier ${nextTierIndex} (${nextTier.vCPU} vCPU, ${nextTier.memoryGb}GB RAM).`);
 
-    return { ...tiers[nextTierIndex], tierIndex: nextTierIndex };
+    return { ...nextTier, tierIndex: nextTierIndex };
 }
 
 /**
@@ -331,7 +370,8 @@ export async function determineScaleInTarget(options) {
     if (!autoscaleConfig) await loadAutoscaleConfig();
 
     const minSize = getValueFromObject(autoscaleConfig, 'scaleIn.minClusterSize');
-    const strategy = getValueFromObject(autoscaleConfig, 'scaleIn.decommissionStrategy');
+    const configuredStrategy = getValueFromObject(autoscaleConfig, 'scaleIn.decommissionStrategy');
+    const strategy = configuredStrategy === "local" ? "local" : "oldest";
 
     const clusterData = await getClusterDetails();
     const activeServers = clusterData.servers;
@@ -347,16 +387,40 @@ export async function determineScaleInTarget(options) {
         };
     }
 
-    let candidateServer = null;
+    let candidateServer;
 
-    if (strategy === "idle") {
-        candidateServer = [...activeServers].sort((a, b) => {
-            const loadA = (a.telemetry?.cpu?.totalUsage || 0) + (a.telemetry?.memory?.percentage || 0);
-            const loadB = (b.telemetry?.cpu?.totalUsage || 0) + (b.telemetry?.memory?.percentage || 0);
-            return loadA - loadB;
-        })[0];
+    if (strategy === "local") {
+        candidateServer = activeServers.find(({ _id }) => String(_id) === String(server.id));
     } else {
-        candidateServer = activeServers[activeServers.length - 1];
+        const createdTime = (serverRecord) => {
+            const timestamp = new Date(
+                serverRecord.created?.on || serverRecord.createdAt || serverRecord.created
+            ).getTime();
+            if (Number.isFinite(timestamp)) return timestamp;
+
+            const id = String(serverRecord._id || "");
+            return /^[a-f\d]{24}$/i.test(id)
+                ? parseInt(id.slice(0, 8), 16) * 1000
+                : Number.MAX_SAFE_INTEGER;
+        };
+
+        candidateServer = [...activeServers].sort((a, b) =>
+            createdTime(a) - createdTime(b) ||
+            String(a._id || "").localeCompare(String(b._id || ""))
+        )[0];
+    }
+
+    if (!candidateServer) {
+        return {
+            canScaleIn: false,
+            reason: strategy === "local"
+                ? `Local server '${server.id}' was not found among the active cluster nodes.`
+                : "No eligible active server was found for scale-in.",
+            candidateServer: null,
+            activeCount: activeServers.length,
+            minClusterSize: minSize,
+            decommissionStrategy: strategy
+        };
     }
 
     return {

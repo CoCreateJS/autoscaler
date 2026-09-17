@@ -96,33 +96,50 @@ To prevent cutting off active user sessions during a scale-down event, the autos
 
 ## Configuration
 
-Place an `autoscaler.config.json` file in your server's root directory to declare your cloud provider credentials, scaling thresholds, and adapter settings.
+Configure the autoscaler with the following policy structure. Cloud-provider connection details remain in the provider API configuration.
 
 ```json
 {
-  "provider": "aws",
-  "credentials": {
-    "region": "us-east-1",
-    "iamRole": "CoCreateAutoscalerRole"
+  "scaleOut": {
+    "cpuThreshold": 85,
+    "memoryThreshold": 85,
+    "consecutiveFlushes": 3,
+    "maxClusterSize": 0
   },
-  "scaling": {
-    "minInstances": 2,
-    "maxInstances": 10,
-    "cooldownPeriodSeconds": 300,
-    "thresholds": {
-      "cpuUtilizationPercent": 80,
-      "memoryUtilizationPercent": 85,
-      "websocketConnectionsPerNode": 5000,
-      "v8LagLimitMs": 100
-    }
+  "scaleIn": {
+    "cpuThreshold": 10,
+    "memoryThreshold": 45,
+    "consecutiveFlushes": 10,
+    "preservation": "continent",
+    "minClusterSize": 2,
+    "decommissionStrategy": "oldest"
   },
-  "replication": {
-    "imageId": "ami-cocreate-node-v1.6.1",
-    "vmType": "t3.medium",
-    "securityGroup": "sg-cocreate-mesh-internal"
+  "geoScale": {
+    "enabled": true,
+    "sheddingThreshold": 20,
+    "densityBy": "continent"
+  },
+  "vertical": {
+    "enabled": true,
+    "maxNodesPerTier": 2,
+    "min": { "vCPU": 1, "memoryGb": 2 },
+    "max": { "vCPU": 64, "memoryGb": 256 }
   }
 }
 ```
+
+### Vertical resource bounds
+
+`vertical.min` defines the first server size and `vertical.max` defines the upper resource boundary. The autoscaler can add up to `maxNodesPerTier` regional servers at the current size. Once that count is reached, the next target doubles the current vCPU and memory values, capped independently by their configured maximums. The cloud adapter then selects the smallest available provider instance that satisfies both target values.
+
+### Decommission strategy
+
+`scaleIn.decommissionStrategy` supports two values:
+
+* `oldest` selects the active server with the earliest `created.on` timestamp. When that timestamp is unavailable, the timestamp embedded in a MongoDB ObjectId is used as a deterministic fallback.
+* `local` selects the server running the autoscaler, allowing an eligible node to decommission itself autonomously. If that server is not present in the active cluster records, scale-in is rejected rather than targeting another node.
+
+Unrecognized strategy values safely fall back to `oldest`.
 
 ---
 
