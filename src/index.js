@@ -68,6 +68,13 @@ let autoscaleConfig = {
 export async function loadAutoscaleConfig() {
     const sysConfig = await config.get('autoscaler');
 
+    const startupConfig = await config.query({
+        type: 'startupscript',
+        organization_id: server.organization_id,
+        server: server.host,
+        cluster: server.cluster_id
+    });
+
     const dbConfig = await config.query({
         type: 'autoscaler',
         organization_id: server.organization_id,
@@ -78,6 +85,11 @@ export async function loadAutoscaleConfig() {
     // Expand & merge system configuration directly into autoscaleConfig
     if (sysConfig) {
         dotNotationToObject(autoscaleConfig, sysConfig);
+    }
+
+    // Shared bootstrap defaults are loaded before provider/autoscaler overrides.
+    if (startupConfig) {
+        dotNotationToObject(autoscaleConfig, startupConfig);
     }
 
     // Expand & merge database overrides directly into autoscaleConfig
