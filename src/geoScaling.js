@@ -43,7 +43,10 @@ export function loadCloudProviders(autoscaleConfigOrClouds = null) {
                 cloudDocs = clouds;
             } else if (clouds && typeof clouds === 'object') {
                 // Handle keyed object map (e.g., { aws: {...}, gcp: {...} })
-                cloudDocs = Object.values(clouds);
+                cloudDocs = Object.entries(clouds).map(([provider, profile]) => ({
+                    ...profile,
+                    provider: profile.provider || provider
+                }));
             }
         }
 
@@ -138,6 +141,8 @@ export function findNearestCloudRegion(targetLatitude, targetLongitude, options 
             minDistance = distance;
             nearestMatch = {
                 provider: loc.provider,
+                providerType: loc.providerType || loc.provider,
+                apiId: loc.apiId,
                 region: loc.region,
                 datacenterName: loc.datacenterName,
                 countryCode: loc.countryCode,
@@ -220,8 +225,7 @@ export function getCloudProvider(clients, options = {}) {
     // Load active cloud providers directly from the passed config/options
     const locations = options.cloudProviders || loadCloudProviders(options.autoscaleConfig || options.clouds || options);
 
-    const preferredProviders = options.preferredProviders || 
-        (options.autoscaleConfig ? getValueFromObject(options.autoscaleConfig, 'autoscaler.preferredProviders') : null);
+    const providers = options.providers;
 
     const totalActiveClients = clients.reduce((sum, item) => sum + (item.count || 1), 0);
 
@@ -229,7 +233,7 @@ export function getCloudProvider(clients, options = {}) {
     if (!options.geoScaleByContinent) {
         const globalCentroid = calculateWeightedCentroid(clients);
         const nearestCloud = globalCentroid ? findNearestCloudRegion(globalCentroid.latitude, globalCentroid.longitude, {
-            providers: preferredProviders,
+            providers,
             cloudProviders: locations,
             autoscaleConfig: options.autoscaleConfig
         }) : null;
@@ -291,7 +295,7 @@ export function getCloudProvider(clients, options = {}) {
 
     if (regionalCentroid) {
         nearestCloud = findNearestCloudRegion(regionalCentroid.latitude, regionalCentroid.longitude, {
-            providers: preferredProviders,
+            providers,
             cloudProviders: locations,
             autoscaleConfig: options.autoscaleConfig
         });

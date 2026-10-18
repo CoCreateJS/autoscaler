@@ -18,47 +18,29 @@
 
 import cluster from 'node:cluster';
 import config from '@cocreate/config';
-import { getValueFromObject, dotNotationToObject } from '@cocreate/utils';
-import { getCloudProvider } from './geoScaling.js';
+import { ObjectId, getValueFromObject, dotNotationToObject } from '@cocreate/utils';
+import { getCloudProvider, loadCloudProviders } from './geoScaling.js';
 
 // Guard clause verification to ensure cluster API abstraction integrity
 const isPrimary = cluster.isPrimary;
 
 let server = null;
 
-let autoscaleConfig = {
-    clouds: {},
-    scaleOut: {
-        cpuThreshold: 85,
-        memoryThreshold: 85,
-        consecutiveFlushes: 3,
-        maxClusterSize: 0
-    },
-    scaleIn: {
-        cpuThreshold: 10,
-        memoryThreshold: 45,
-        consecutiveFlushes: 10,
-        preservation: "continent",
-        minClusterSize: 2,
-        decommissionStrategy: "oldest"
-    },
-    geoScale: {
-        enabled: true,
-        sheddingThreshold: 20,
-        densityBy: "continent"
-    },
-    vertical: {
-        enabled: true,
-        maxNodesPerTier: 2,
-        min: { vCPU: 1, memoryGb: 2 },
-        max: { vCPU: 64, memoryGb: 256 }
-    }
-};
+let autoscaleConfig = {};
+let allowedApis = [];
+const workerStreaks = new Map();
+let evaluating = false;
+let lastActionAt = 0;
+let floorLeader = null;
+let lastFloorCheckAt = 0;
+
+function isAutoscalingEnabled() {
+    return getValueFromObject(autoscaleConfig, 'autoscaling.enabled') === true;
+}
 
 /**
- * Loads system configuration using @cocreate/config, queries the database's 'servers_config'
- * collection via config.query for matching 'autoscaler' entries, and processes standard
- * objects as well as dot-notation paths using `dotNotationToObject`.
+ * Uses this server's cluster as the baseline, then applies matching system and
+ * servers_config records in their configured order.
  * 
  * Autoscaler is the sole module responsible for loading and resolving configuration early
  * in the pipeline before passing the resolved object to downstream modules like GeoScaling.
@@ -66,38 +48,57 @@ let autoscaleConfig = {
  * @returns {Promise<Object>} The resolved autoscale configuration
  */
 export async function loadAutoscaleConfig() {
+    const resolved = {};
+    if (server.id) {
+        const response = await server.crud.send({
+            method: 'object.read',
+            array: 'servers',
+            organization_id: server.organization_id,
+            host: server.host,
+            filter: { query: { _id: server.id }, limit: 1 }
+        });
+        server.cluster_id = response?.object?.[0]?.cluster_id || server.cluster_id;
+    }
+    if (server.cluster_id) {
+        const response = await server.crud.send({
+            method: 'object.read',
+            array: 'clusters',
+            organization_id: server.organization_id,
+            host: server.host,
+            filter: { query: { _id: server.cluster_id }, limit: 1 }
+        });
+        const clusterConfig = response?.object?.[0];
+        if (clusterConfig) dotNotationToObject(clusterConfig, resolved);
+    }
+
     const sysConfig = await config.get('autoscaler');
 
-    const startupConfig = await config.query({
-        type: 'startupscript',
-        organization_id: server.organization_id,
-        server: server.host,
-        cluster: server.cluster_id
-    });
-
     const dbConfig = await config.query({
-        type: 'autoscaler',
+        type: ['startupscript', 'autoscaler'],
         organization_id: server.organization_id,
         server: server.host,
         cluster: server.cluster_id
-    });
+    }, server.crud);
 
-    // Expand & merge system configuration directly into autoscaleConfig
-    if (sysConfig) {
-        dotNotationToObject(autoscaleConfig, sysConfig);
+    // The cluster is the baseline; matching configs overwrite it in query order.
+    if (sysConfig) dotNotationToObject(sysConfig, resolved);
+    if (dbConfig) dotNotationToObject(dbConfig, resolved);
+
+    const providerIds = resolved.providers;
+    allowedApis = [];
+    if (Array.isArray(providerIds) && providerIds.length) {
+        const responses = await Promise.all(providerIds.map(id => server.crud.send({
+            method: 'object.read',
+            array: 'apis',
+            organization_id: server.organization_id,
+            host: server.host,
+            filter: { query: { _id: id, type: 'cloud', enabled: true }, limit: 1 }
+        })));
+        allowedApis = responses.map(response => response?.object?.[0]).filter(Boolean);
     }
 
-    // Shared bootstrap defaults are loaded before provider/autoscaler overrides.
-    if (startupConfig) {
-        dotNotationToObject(autoscaleConfig, startupConfig);
-    }
-
-    // Expand & merge database overrides directly into autoscaleConfig
-    if (dbConfig) {
-        dotNotationToObject(autoscaleConfig, dbConfig);
-    }
-
-    return autoscaleConfig;
+    autoscaleConfig = resolved;
+    return resolved;
 }
 
 /**
@@ -106,32 +107,76 @@ export async function loadAutoscaleConfig() {
  * @param {Object} [query={}] - Optional query filters to merge with default master status
  * @returns {Promise<Object>} Cluster snapshot including averages and raw active servers array
  */
-async function getClusterDetails(query = {}) {
+async function getClusterDetails(query = {}, currentSample) {
     const readResponse = await server.crud.send({
         method: 'object.read',
         array: 'servers',
         filter: {
             query: {
                 'master.status': 'running',
-                ...query
+                ...query,
+                cluster_id: server.cluster_id
             }
         },
         organization_id: server.organization_id,
         host: server.host
     });
 
-    const activeServers = readResponse.object || [];
+    if (readResponse?.error?.length) throw new Error('Unable to read active cluster servers.');
+    const activeServers = readResponse?.object || [];
+    const pendingResponse = await server.crud.send({
+        method: 'object.read',
+        array: 'servers',
+        filter: { query: { cluster_id: server.cluster_id, 'master.status': 'provisioning' }, limit: 0 },
+        organization_id: server.organization_id,
+        host: server.host
+    });
+    if (pendingResponse?.error?.length) throw new Error('Unable to read provisioning cluster servers.');
+    const pendingCount = pendingResponse?.object?.length || 0;
 
-    let totalCpu = 0;
-    let totalMem = 0;
-
-    for (const serverRecord of activeServers) {
-        const peerTelemetry = serverRecord.telemetry || {};
-        totalCpu += peerTelemetry.cpu?.totalUsage || 0;
-        totalMem += peerTelemetry.memory?.percentage || 0;
+    // Telemetry is written to its own collection, not embedded in servers.
+    const interval = Number(currentSample?.interval_seconds) * 1000 || 60000;
+    const since = new Date(Date.now() - interval * 2).toISOString();
+    const ids = activeServers.map(item => String(item._id));
+    const telemetryResponse = ids.length ? await server.crud.send({
+        method: 'object.read',
+        array: 'servers_telemetry',
+        filter: {
+            query: { serverId: { $in: ids }, timestamp: { $gte: since } },
+            sort: [{ key: 'timestamp', direction: 'desc' }],
+            limit: 0
+        },
+        organization_id: server.organization_id,
+        host: server.host
+    }) : null;
+    if (telemetryResponse?.error?.length) throw new Error('Unable to read cluster telemetry.');
+    const latestWorkers = new Map();
+    for (const sample of telemetryResponse?.object || []) {
+        const key = `${sample.serverId}:${sample.workerId}`;
+        if (!latestWorkers.has(key)) latestWorkers.set(key, sample);
     }
-
-    const count = activeServers.length || 1;
+    if (currentSample) {
+        latestWorkers.set(`${currentSample.serverId}:${currentSample.workerId}`, currentSample);
+    }
+    const samples = [...latestWorkers.values()];
+    const byServer = new Map();
+    for (const sample of samples) {
+        const id = String(sample.serverId);
+        const entry = byServer.get(id) || { cpu: 0, memory: 0, workers: 0, timestamp: '' };
+        entry.cpu += Number(sample.cpu?.avg || 0);
+        entry.memory += Number(sample.memory?.avg_used_pct || 0);
+        entry.workers++;
+        if (!entry.timestamp || sample.timestamp < entry.timestamp) entry.timestamp = sample.timestamp;
+        byServer.set(id, entry);
+    }
+    const serverMetrics = new Map([...byServer].map(([id, entry]) => [id, {
+        cpu: entry.cpu / entry.workers,
+        memory: entry.memory / entry.workers,
+        timestamp: entry.timestamp
+    }]));
+    const totalCpu = samples.reduce((sum, item) => sum + Number(item.cpu?.avg || 0), 0);
+    const totalMem = samples.reduce((sum, item) => sum + Number(item.memory?.avg_used_pct || 0), 0);
+    const count = samples.length || 1;
 
     return {
         avgCpu: totalCpu / count,
@@ -139,6 +184,9 @@ async function getClusterDetails(query = {}) {
         totalCpu,
         totalMem,
         totalCount: activeServers.length,
+        pendingCount,
+        sampledServers: new Set(samples.map(item => String(item.serverId))).size,
+        serverMetrics,
         servers: activeServers
     };
 }
@@ -153,24 +201,23 @@ async function getClusterDetails(query = {}) {
  * @returns {Object} Target tier specifications { vCPU, memoryGb, tierIndex }
  */
 function determineTargetTier(targetRegion, activeClusterServers) {
-    const isVerticalEnabled = getValueFromObject(autoscaleConfig, 'vertical.enabled');
     const minimum = getValueFromObject(autoscaleConfig, 'vertical.min') || {};
     const maximum = getValueFromObject(autoscaleConfig, 'vertical.max') || {};
+    const maxNodesPerTier = Number(getValueFromObject(autoscaleConfig, 'vertical.maxNodesPerTier'));
+    if (![minimum.vCPU, minimum.memoryGb, maximum.vCPU, maximum.memoryGb, maxNodesPerTier]
+        .every(value => Number.isFinite(Number(value)) && Number(value) > 0)) {
+        throw new Error('Vertical scaling requires configured min, max, and maxNodesPerTier values.');
+    }
     const minTier = {
-        vCPU: Math.max(1, Number(minimum.vCPU) || 1),
-        memoryGb: Math.max(1, Number(minimum.memoryGb) || 2)
+        vCPU: Number(minimum.vCPU),
+        memoryGb: Number(minimum.memoryGb)
     };
     const maxTier = {
-        vCPU: Math.max(minTier.vCPU, Number(maximum.vCPU) || 64),
-        memoryGb: Math.max(minTier.memoryGb, Number(maximum.memoryGb) || 256)
+        vCPU: Number(maximum.vCPU),
+        memoryGb: Number(maximum.memoryGb)
     };
-    const maxNodesPerTier = Math.max(
-        1,
-        parseInt(getValueFromObject(autoscaleConfig, 'vertical.maxNodesPerTier'), 10) || 2
-    );
-
-    if (!isVerticalEnabled) {
-        return { ...minTier, tierIndex: 0 };
+    if (maxTier.vCPU < minTier.vCPU || maxTier.memoryGb < minTier.memoryGb) {
+        throw new Error('Vertical scaling maximum must be at least its minimum.');
     }
 
     const regionalServers = activeClusterServers.filter((serverNode) =>
@@ -263,7 +310,7 @@ function selectInstanceType(instances = [], targetTier) {
         return suitable[0].name;
     }
 
-    return instances[instances.length - 1]?.name || 'default';
+    throw new Error(`No configured instance satisfies ${requiredCpu} vCPU and ${requiredMem} GB memory.`);
 }
 
 /**
@@ -273,33 +320,67 @@ function selectInstanceType(instances = [], targetTier) {
  * @param {Array<Object>} clientLocations - Active client traffic distribution points
  * @returns {Promise<Object>} Target specification object calculated for scale-out
  */
-export async function determineScaleOutTarget(clientLocations) {
-    if (!autoscaleConfig) await loadAutoscaleConfig();
+export async function determineScaleOutTarget(clientLocations, activeServers = []) {
+    if (!isAutoscalingEnabled()) throw new Error('Autoscaling is disabled.');
+    if (!server.cluster_id) throw new Error('Autoscaling requires a cluster ID.');
+    if (!allowedApis.length) throw new Error('Autoscaling requires enabled cloud APIs in cluster providers.');
 
     const isGeoEnabled = getValueFromObject(autoscaleConfig, 'geoScale.enabled');
     const sheddingThreshold = getValueFromObject(autoscaleConfig, 'geoScale.sheddingThreshold');
-    const preferredProviders = getValueFromObject(autoscaleConfig, 'preferredProviders');
+    if (isGeoEnabled === true && !Number.isFinite(Number(sheddingThreshold))) {
+        throw new Error('Geographic scaling requires a configured shedding threshold.');
+    }
+    const regions = loadCloudProviders(autoscaleConfig);
+    const cloudProviders = allowedApis.flatMap(api =>
+        regions.filter(region => region.provider === api.provider).map(region => ({
+            ...region,
+            provider: api.name,
+            providerType: api.provider,
+            apiId: api._id
+        }))
+    );
 
     const geoTarget = await getCloudProvider(clientLocations, {
         geoScaleByContinent: isGeoEnabled,
         sheddingThreshold,
-        preferredProviders,
+        cloudProviders,
+        existingNodes: activeServers.map(item => ({
+            continent: item.location?.continent || item.infrastructure?.continent
+        })),
         autoscaleConfig
-    }, server);
+    });
 
-    const cloudRegion = geoTarget.nearestCloudRegion;
+    const cloudRegion = geoTarget?.nearestCloudRegion;
+    if (!cloudRegion) throw new Error('No configured region matches the enabled cluster providers.');
     const provider = cloudRegion.provider;
+    const providerType = cloudRegion.providerType;
     const region = cloudRegion.region;
     const providerInstances = cloudRegion.instances;
 
     const clusterData = await getClusterDetails();
     const activeServers = clusterData.servers;
 
-    const targetTier = determineTargetTier(region, activeServers);
-    const instanceType = selectInstanceType(providerInstances, targetTier);
+    const defaultInstance = providerInstances.find(instance => instance.default);
+    if (defaultInstance && (![defaultInstance.vCPU, defaultInstance.memoryGb]
+        .every(value => Number.isFinite(Number(value)) && Number(value) > 0))) {
+        throw new Error(`The default instance for ${providerType} needs vCPU and memoryGb.`);
+    }
+    const targetTier = getValueFromObject(autoscaleConfig, 'vertical.enabled') === true
+        ? determineTargetTier(region, activeServers)
+        : defaultInstance && {
+            vCPU: Number(defaultInstance.vCPU),
+            memoryGb: Number(defaultInstance.memoryGb),
+            tierIndex: 0
+        };
+    if (!targetTier) throw new Error(`No default instance is configured for ${providerType}.`);
+    const instanceType = getValueFromObject(autoscaleConfig, 'vertical.enabled') === true
+        ? selectInstanceType(providerInstances, targetTier)
+        : defaultInstance.name;
 
     const result = {
         provider,
+        providerType,
+        apiId: cloudRegion.apiId,
         region,
         instanceType,
         vCPU: targetTier.vCPU,
@@ -330,35 +411,107 @@ export async function determineScaleOutTarget(clientLocations) {
  * @param {Array<Object>} clientLocations - Active client traffic location points
  * @returns {Promise<Object>} API execution result payload
  */
-export async function scaleOut(clientLocations) {
-    if (!autoscaleConfig) await loadAutoscaleConfig();
-
-    const target = await determineScaleOutTarget(clientLocations);
+export async function scaleOut(clientLocations, activeServers = []) {
+    const target = await determineScaleOutTarget(clientLocations, activeServers);
     const provider = target.provider;
+    const providerType = target.providerType;
 
     // Retrieve static provisioning configurations directly from autoscaleConfig
     const spot = getValueFromObject(autoscaleConfig, 'spot');
-    const startupScript = getValueFromObject(autoscaleConfig, `clouds.${provider}.startupScript`) || getValueFromObject(autoscaleConfig, 'startupScript');
-    const os = getValueFromObject(autoscaleConfig, `clouds.${provider}.os`) || getValueFromObject(autoscaleConfig, 'os');
-    const application = getValueFromObject(autoscaleConfig, `clouds.${provider}.application`) || getValueFromObject(autoscaleConfig, 'application');
-    const endpoint = getValueFromObject(autoscaleConfig, `clouds.${provider}.endpoint.create`);
+    const startupScript = getValueFromObject(autoscaleConfig, `clouds.${providerType}.startupScript`) || getValueFromObject(autoscaleConfig, 'startupScript');
+    const os = getValueFromObject(autoscaleConfig, `clouds.${providerType}.os`) || getValueFromObject(autoscaleConfig, 'os');
+    const application = getValueFromObject(autoscaleConfig, `clouds.${providerType}.application`) || getValueFromObject(autoscaleConfig, 'application');
+    const endpoint = getValueFromObject(autoscaleConfig, `clouds.${providerType}.endpoint.create`) ||
+        getValueFromObject(autoscaleConfig, 'endpoint.create');
+    const method = getValueFromObject(autoscaleConfig, `clouds.${providerType}.method.create`);
+    if (!endpoint) throw new Error(`No create endpoint is configured for ${providerType}.`);
+    if (!startupScript) throw new Error('Scale-out requires a startup script.');
+    const binaryUrl = getValueFromObject(autoscaleConfig, 'binaryUrl');
+    const deploymentHost = getValueFromObject(autoscaleConfig, 'host') || server.host;
+    if (!binaryUrl || !deploymentHost) {
+        throw new Error('Scale-out requires a binary URL and deployment host.');
+    }
+
+    const bootstrapStorage = await config.get('storage');
+    const storageId = getValueFromObject(autoscaleConfig, 'storageProvider');
+    let storage = bootstrapStorage;
+    if (storageId) {
+        const storageResponse = await server.crud.send({
+            method: 'object.read',
+            array: 'apis',
+            filter: { query: { _id: storageId, type: 'storage', enabled: true }, limit: 1 },
+            organization_id: server.organization_id,
+            host: server.host
+        });
+        if (storageResponse?.error?.length) throw new Error('Unable to read the cluster storage API.');
+        const storageApi = storageResponse?.object?.[0];
+        if (!storageApi) throw new Error('The cluster storage API is unavailable.');
+        const credentials = { ...storageApi };
+        for (const field of [
+            '_id', 'description', 'enabled', 'type', 'created', 'modified',
+            'organization_id', 'host', 'server', 'worker', 'cluster'
+        ]) delete credentials[field];
+        const hasCredentials = Object.entries(credentials).some(([key, value]) =>
+            !['name', 'provider'].includes(key) && value !== '' && value != null
+        );
+        if (hasCredentials) storage = { [storageApi.name]: credentials };
+    }
+    if (!storage || !Object.keys(storage).length) {
+        throw new Error('Scale-out requires bootstrap or cluster storage configuration.');
+    }
+
+    const serverId = ObjectId().toString();
+    const newServer = {
+        _id: serverId,
+        cluster_id: server.cluster_id,
+        api_id: target.apiId,
+        host: server.host,
+        totalWorkers: 0,
+        master: { status: 'provisioning' },
+        infrastructure: {
+            api_id: target.apiId,
+            provider: providerType,
+            region: target.region,
+            vmType: target.instanceType,
+            vCPU: target.vCPU,
+            memoryGb: target.memoryGb
+        }
+    };
+    const created = await server.crud.send({
+        method: 'object.create',
+        array: 'servers',
+        object: newServer,
+        organization_id: server.organization_id,
+        host: server.host
+    });
+    if (created?.error?.length || !created?.object?.length) {
+        throw new Error('Unable to reserve a server record for scale-out.');
+    }
 
     console.log(`[@cocreate/server-autoscaler] [SCALE-OUT] Sending instance creation API request for provider [${provider}] on endpoint [${endpoint}] in region [${target.region}]...`);
 
     const apiPayload = {
-        method: provider,
+        api: provider,
+        ...(method && { method }),
         endpoint,
         organization_id: server.organization_id,
         host: server.host,
-        [provider]: {
-            provider: target.provider,
+        region: target.region,
+        data: {
+            provider: providerType,
+            api_id: target.apiId,
             region: target.region,
-            instanceType: target.instanceType,
+            vmType: target.instanceType,
             vCPU: target.vCPU,
             memoryGb: target.memoryGb,
             datacenterName: target.datacenterName,
             countryCode: target.countryCode,
             cluster_id: server.cluster_id,
+            server_id: serverId,
+            host: deploymentHost,
+            binaryUrl,
+            environment: `server_id=${serverId}\ncluster_id=${server.cluster_id}`,
+            storage: Buffer.from(JSON.stringify(storage)).toString('base64'),
             spot,
             startupScript,
             os,
@@ -366,9 +519,23 @@ export async function scaleOut(clientLocations) {
         }
     };
 
-    const response = await server.api.send(apiPayload);
-    console.log("[@cocreate/server-autoscaler] [SCALE-OUT] API response received:", response);
-    return response;
+    try {
+        const response = await server.api.send(apiPayload);
+        if (response?.error?.length || response?.success === false) {
+            throw new Error('The cloud API rejected the scale-out request.');
+        }
+        console.log(`[@cocreate/server-autoscaler] [SCALE-OUT] Provisioning server ${serverId}.`);
+        return response;
+    } catch (error) {
+        await server.crud.send({
+            method: 'object.update',
+            array: 'servers',
+            object: { _id: serverId, master: { status: 'failed' } },
+            organization_id: server.organization_id,
+            host: server.host
+        });
+        throw error;
+    }
 }
 
 /**
@@ -379,14 +546,26 @@ export async function scaleOut(clientLocations) {
  * @returns {Promise<Object>} Evaluation result containing selected candidate server and reason
  */
 export async function determineScaleInTarget(options) {
-    if (!autoscaleConfig) await loadAutoscaleConfig();
+    if (!isAutoscalingEnabled()) {
+        return { canScaleIn: false, reason: 'Autoscaling is disabled.', candidateServer: null };
+    }
+    if (!server.cluster_id) {
+        return { canScaleIn: false, reason: 'Autoscaling requires a cluster ID.', candidateServer: null };
+    }
 
-    const minSize = getValueFromObject(autoscaleConfig, 'scaleIn.minClusterSize');
+    const minSize = Number(getValueFromObject(autoscaleConfig, 'scaleIn.minClusterSize'));
     const configuredStrategy = getValueFromObject(autoscaleConfig, 'scaleIn.decommissionStrategy');
-    const strategy = configuredStrategy === "local" ? "local" : "oldest";
+    if (!Number.isFinite(minSize) || minSize < 0 || !['local', 'oldest'].includes(configuredStrategy)) {
+        return { canScaleIn: false, reason: 'Scale-in policy is incomplete.', candidateServer: null };
+    }
+    const strategy = configuredStrategy;
 
     const clusterData = await getClusterDetails();
     const activeServers = clusterData.servers;
+    if (activeServers.some(item => item.decommission?.status === 'draining' ||
+        item.decommission?.status === 'terminating')) {
+        return { canScaleIn: false, reason: 'A node is already being removed.', candidateServer: null };
+    }
 
     if (activeServers.length <= minSize) {
         console.log(`[@cocreate/server-autoscaler] [SCALE-IN PREVIEW] Cannot scale in: Active nodes (${activeServers.length}) is at or below cluster floor (${minSize}).`);
@@ -445,16 +624,104 @@ export async function determineScaleInTarget(options) {
     };
 }
 
+function checkScaleInCapacity(snapshot, candidateId, observedAfter) {
+    const minimum = Number(getValueFromObject(autoscaleConfig, 'scaleIn.minClusterSize'));
+    const maxCpu = Number(getValueFromObject(autoscaleConfig, 'scaleOut.cpuThreshold'));
+    const maxMemory = Number(getValueFromObject(autoscaleConfig, 'scaleOut.memoryThreshold'));
+    const remaining = snapshot.servers.filter(item => String(item._id) !== String(candidateId));
+    if (!Number.isInteger(minimum) || minimum < 0 || remaining.length < minimum) {
+        return { ok: false, reason: 'Removing this node would breach the cluster minimum.' };
+    }
+    if (snapshot.pendingCount || remaining.some(item =>
+        ['draining', 'terminating'].includes(item.decommission?.status))) {
+        return { ok: false, reason: 'Another cluster capacity change is in progress.' };
+    }
+    if (![maxCpu, maxMemory].every(value => Number.isFinite(value) && value > 0 && value <= 100)) {
+        return { ok: false, reason: 'Scale-out capacity thresholds are incomplete.' };
+    }
+
+    let cpuDemand = 0;
+    let memoryDemand = 0;
+    let cpuCapacity = 0;
+    let memoryCapacity = 0;
+    for (const item of snapshot.servers) {
+        const isCandidate = String(item._id) === String(candidateId);
+        if (observedAfter && isCandidate) continue;
+        const metrics = snapshot.serverMetrics.get(String(item._id));
+        const vCPU = Number(item.infrastructure?.vCPU || item.vCPU);
+        const memoryGb = Number(item.infrastructure?.memoryGb || item.memoryGb);
+        if (!metrics || ![vCPU, memoryGb].every(value => Number.isFinite(value) && value > 0) ||
+            ![metrics.cpu, metrics.memory].every(value => Number.isFinite(value) && value >= 0)) {
+            return { ok: false, reason: 'Fresh telemetry and instance capacity are required for every node.' };
+        }
+        if (!isCandidate) {
+            if (observedAfter && metrics.timestamp <= observedAfter) {
+                return { ok: false, reason: 'Waiting for fresh telemetry from remaining nodes.' };
+            }
+            cpuCapacity += vCPU;
+            memoryCapacity += memoryGb;
+            if (observedAfter && (metrics.cpu >= maxCpu || metrics.memory >= maxMemory)) {
+                return { ok: false, reason: 'A remaining node is at its capacity threshold.' };
+            }
+        }
+        if (!observedAfter) {
+            cpuDemand += metrics.cpu / 100 * vCPU;
+            memoryDemand += metrics.memory / 100 * memoryGb;
+        }
+    }
+    if (!cpuCapacity || !memoryCapacity) {
+        return { ok: false, reason: 'No remaining capacity is available.' };
+    }
+    if (!observedAfter &&
+        (cpuDemand / cpuCapacity * 100 >= maxCpu ||
+            memoryDemand / memoryCapacity * 100 >= maxMemory)) {
+        return { ok: false, reason: 'Projected demand exceeds remaining cluster capacity.' };
+    }
+    return { ok: true };
+}
+
+async function setDecommission(serverId, status, startedAt) {
+    const result = await server.crud.send({
+        method: 'object.update',
+        array: 'servers',
+        object: {
+            _id: serverId,
+            decommission: { status, startedAt, by: server.id }
+        },
+        organization_id: server.organization_id,
+        host: server.host
+    });
+    if (result?.error?.length) throw new Error(`Unable to mark server as ${status}.`);
+}
+
+async function sendDrain(serverId, value) {
+    if (String(serverId) === String(server.id) && server.totalWorkers <= 1) {
+        await server.state.drain(value);
+    } else {
+        await server.send({ method: 'drain', server: serverId, broadcast: true, master: false, value });
+    }
+}
+
 /**
- * Triggers horizontal scale-in decommissioning workflow:
- * 1. Resolves target server candidate to scale in using determineScaleInTarget.
- * 2. Dispatches instance termination API call via server.api.send.
+ * Removes a node after verifying projected capacity, draining it, and observing
+ * fresh telemetry from the remaining cluster nodes.
  * 
  * @param {Object} [targetServer] - Optional target server document to decommission
  * @returns {Promise<Object>} API execution result payload
  */
 export async function scaleIn(targetServer) {
+    if (!isAutoscalingEnabled()) throw new Error('Autoscaling is disabled.');
+    if (!server.cluster_id) throw new Error('Autoscaling requires a cluster ID.');
     let candidateServer = targetServer;
+
+    if (candidateServer) {
+        const minSize = Number(getValueFromObject(autoscaleConfig, 'scaleIn.minClusterSize'));
+        if (!Number.isFinite(minSize) || minSize < 0) {
+            throw new Error('Scale-in requires a configured minimum cluster size.');
+        }
+        const clusterData = await getClusterDetails();
+        if (clusterData.totalCount <= minSize) return null;
+    }
 
     if (!candidateServer) {
         const scaleInTarget = await determineScaleInTarget();
@@ -465,31 +732,239 @@ export async function scaleIn(targetServer) {
         console.log("[@cocreate/server-autoscaler] [SCALE-IN] Aborted: No valid scale-in candidate server found.");
         return null;
     }
+    if (String(candidateServer.cluster_id) !== String(server.cluster_id)) {
+        throw new Error('The server is outside the current cluster.');
+    }
 
-    const provider = candidateServer.provider;
-    const vmId = candidateServer.vmId;
+    const apiId = candidateServer.api_id || candidateServer.infrastructure?.api_id;
+    const api = allowedApis.find(item => String(item._id) === String(apiId));
+    if (!api) throw new Error('The server API is not allowed by the cluster providers.');
+    const provider = api.name;
+    const vmId = candidateServer.infrastructure?.vmId || candidateServer.vmId;
+    const region = candidateServer.infrastructure?.region || candidateServer.region;
 
     // Retrieve delete endpoint directly from autoscaleConfig
-    const endpoint = getValueFromObject(autoscaleConfig, `clouds.${provider}.endpoint.delete`);
+    const endpoint = getValueFromObject(autoscaleConfig, `clouds.${api.provider}.endpoint.delete`) ||
+        getValueFromObject(autoscaleConfig, 'endpoint.delete');
+    const method = getValueFromObject(autoscaleConfig, `clouds.${api.provider}.method.delete`);
+    if (!endpoint) throw new Error(`No delete endpoint is configured for ${api.provider}.`);
+    if (!vmId || !region) throw new Error('The scale-in candidate needs a VM ID and region.');
+    const drainWaitSeconds = Number(getValueFromObject(autoscaleConfig, 'scaleIn.drainWaitSeconds'));
+    if (!Number.isInteger(drainWaitSeconds) || drainWaitSeconds < 1) {
+        throw new Error('Scale-in requires a configured drain observation interval.');
+    }
 
-    console.log(`[@cocreate/server-autoscaler] [SCALE-IN] Sending instance termination API request for provider [${provider}] on endpoint [${endpoint}] for node [${vmId}]...`);
+    const before = await getClusterDetails();
+    if (!before.servers.some(item => String(item._id) === String(candidateServer._id))) return null;
+    if (before.servers.some(item => ['draining', 'terminating'].includes(item.decommission?.status))) {
+        return null;
+    }
+    const projected = checkScaleInCapacity(before, candidateServer._id);
+    if (!projected.ok) {
+        console.log(`[@cocreate/server-autoscaler] [SCALE-IN] ${projected.reason}`);
+        return null;
+    }
+
+    console.log(`[@cocreate/server-autoscaler] [SCALE-IN] Draining node [${vmId}] before provider [${provider}] termination.`);
 
     const apiPayload = {
-        method: provider,
+        api: provider,
+        ...(method && { method }),
         endpoint,
         organization_id: server.organization_id,
         host: server.host,
-        [provider]: {
-            serverId: candidateServer._id,
+        region,
+        data: {
+            server_id: candidateServer._id,
             vmId: vmId,
-            provider: provider,
-            region: candidateServer.region
+            provider: api.provider,
+            region
         }
     };
 
-    const response = await server.api.send(apiPayload);
-    console.log("[@cocreate/server-autoscaler] [SCALE-IN] API response received:", response);
-    return response;
+    const startedAt = new Date().toISOString();
+    let draining = false;
+    try {
+        await setDecommission(candidateServer._id, 'draining', startedAt);
+        // A partial delivery can still reach the target when dispatch throws.
+        // Always attempt to restore it if anything after this point fails.
+        draining = true;
+        await sendDrain(candidateServer._id, true);
+
+        let observed;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            await new Promise(resolve => setTimeout(resolve, drainWaitSeconds * 1000));
+            const after = await getClusterDetails();
+            observed = checkScaleInCapacity(after, candidateServer._id, startedAt);
+            if (observed.ok || observed.reason !== 'Waiting for fresh telemetry from remaining nodes.') break;
+        }
+        if (!observed?.ok) throw new Error(observed?.reason || 'Scale-in capacity check failed.');
+
+        console.log(`[@cocreate/server-autoscaler] [SCALE-IN] Sending termination request for node [${vmId}] to provider [${provider}] endpoint [${endpoint}].`);
+        const response = await server.api.send(apiPayload);
+        if (response?.error?.length || response?.success === false) {
+            throw new Error('The cloud API rejected the termination request.');
+        }
+        try {
+            await setDecommission(candidateServer._id, 'terminating', startedAt);
+        } catch (error) {
+            console.error('[@cocreate/server-autoscaler] Could not record termination state:', error);
+        }
+        return response;
+    } catch (error) {
+        if (draining) {
+            try {
+                await sendDrain(candidateServer._id, false);
+            } catch (restoreError) {
+                console.error('[@cocreate/server-autoscaler] Could not restore the drained server:', restoreError);
+            }
+        }
+        try {
+            await setDecommission(candidateServer._id, 'cancelled', startedAt);
+        } catch (stateError) {
+            console.error('[@cocreate/server-autoscaler] Could not cancel decommission state:', stateError);
+        }
+        throw error;
+    }
+}
+
+function thresholdReached(value, threshold) {
+    return Number.isFinite(Number(threshold)) && Number(value) >= Number(threshold);
+}
+
+function thresholdBelow(value, threshold) {
+    return Number.isFinite(Number(threshold)) && Number(value) < Number(threshold);
+}
+
+function isScaleInCoordinator(snapshot, policy) {
+    // Every node chooses from the same cluster snapshot. The lowest-ID node
+    // with low local load coordinates this decision; the configured strategy still
+    // decides which node is removed.
+    const eligible = snapshot.servers.filter(item => {
+        const metrics = snapshot.serverMetrics.get(String(item._id));
+        return metrics && thresholdBelow(metrics.cpu, policy.cpuThreshold) &&
+            thresholdBelow(metrics.memory, policy.memoryThreshold);
+    });
+    return eligible.map(item => String(item._id)).sort()[0] === String(server.id);
+}
+
+function placementLocations(sample) {
+    const clients = sample.custom?.clientLocations;
+    if (Array.isArray(clients) && clients.length) return clients;
+
+    // A server location is a fallback until client geography is supplied by telemetry.
+    const location = server.location || {};
+    if (Number.isFinite(Number(location.latitude)) && Number.isFinite(Number(location.longitude))) {
+        return [{
+            latitude: Number(location.latitude),
+            longitude: Number(location.longitude),
+            continent: location.continent,
+            count: 1
+        }];
+    }
+    const firstRegion = loadCloudProviders(autoscaleConfig).find(region =>
+        allowedApis.some(api => api.provider === region.provider)
+    );
+    return firstRegion ? [{
+        latitude: firstRegion.lat,
+        longitude: firstRegion.lng,
+        count: 1
+    }] : [];
+}
+
+/** Evaluate local flushes first. Only a sustained local signal reads peer telemetry. */
+async function onTelemetry(message) {
+    if (!isAutoscalingEnabled() || !server.cluster_id) return;
+    const sample = message?.data;
+    if (!sample || String(sample.serverId) !== String(server.id)) return;
+
+    const workerId = String(sample.workerId ?? message.workerId ?? 0);
+    const previous = workerStreaks.get(workerId) || { out: 0, in: 0 };
+    if (previous.timestamp === sample.timestamp) return;
+
+    const outPolicy = getValueFromObject(autoscaleConfig, 'scaleOut') || {};
+    const inPolicy = getValueFromObject(autoscaleConfig, 'scaleIn') || {};
+    const cpu = Number(sample.cpu?.avg);
+    const memory = Number(sample.memory?.avg_used_pct);
+    if (!Number.isFinite(cpu) || !Number.isFinite(memory)) return;
+
+    const out = thresholdReached(cpu, outPolicy.cpuThreshold) ||
+        thresholdReached(memory, outPolicy.memoryThreshold);
+    const inside = thresholdBelow(cpu, inPolicy.cpuThreshold) &&
+        thresholdBelow(memory, inPolicy.memoryThreshold);
+    const streak = {
+        out: out ? previous.out + 1 : 0,
+        in: inside ? previous.in + 1 : 0,
+        timestamp: sample.timestamp
+    };
+    workerStreaks.set(workerId, streak);
+
+    const outFlushes = Number(outPolicy.consecutiveFlushes);
+    const inFlushes = Number(inPolicy.consecutiveFlushes);
+    const needsPressureCheck =
+        (Number.isInteger(outFlushes) && outFlushes > 0 && streak.out >= outFlushes) ||
+        (Number.isInteger(inFlushes) && inFlushes > 0 && streak.in >= inFlushes);
+    const minimum = Number(inPolicy.minClusterSize);
+    const intervalMs = Math.max(1000, Number(sample.interval_seconds || 60) * 1000);
+    const floorRefreshMs = intervalMs * Math.max(1, inFlushes || 1);
+    const needsFloorCheck = Number.isInteger(minimum) && minimum > 0 &&
+        (floorLeader !== false || Date.now() - lastFloorCheckAt >= floorRefreshMs) &&
+        Date.now() - lastFloorCheckAt >= intervalMs;
+    if (!needsPressureCheck && !needsFloorCheck) return;
+    if (evaluating) return;
+
+    const cooldownMs = intervalMs * Math.max(1, outFlushes || 1, inFlushes || 1);
+    if (Date.now() - lastActionAt < cooldownMs && !needsFloorCheck) return;
+
+    evaluating = true;
+    try {
+        const clusterData = await getClusterDetails({}, sample);
+        const activeCount = clusterData.totalCount;
+        const clusterSize = activeCount + clusterData.pendingCount;
+        const firstId = clusterData.servers.map(item => String(item._id)).sort()[0];
+        floorLeader = firstId === String(server.id);
+        lastFloorCheckAt = Date.now();
+        if (clusterData.servers.some(item =>
+            ['draining', 'terminating'].includes(item.decommission?.status))) return;
+        const maximum = Number(outPolicy.maxClusterSize);
+        const canAdd = !Number.isInteger(maximum) || maximum === 0 || clusterSize < maximum;
+
+        if (Number.isInteger(minimum) && minimum > 0 && clusterSize < minimum) {
+            // Only one active node attempts to repair the cluster floor.
+            if (canAdd && !clusterData.pendingCount && floorLeader &&
+                Date.now() - lastActionAt >= cooldownMs) {
+                await scaleOut(placementLocations(sample), clusterData.servers);
+                lastActionAt = Date.now();
+            }
+            return;
+        }
+
+        // Missing or stale peer samples cannot establish cluster-wide pressure.
+        if (clusterData.sampledServers !== activeCount || !activeCount) return;
+        if (Date.now() - lastActionAt >= cooldownMs && canAdd && !clusterData.pendingCount &&
+            Number.isInteger(outFlushes) && outFlushes > 0 &&
+            streak.out >= outFlushes &&
+            (thresholdReached(clusterData.avgCpu, outPolicy.cpuThreshold) ||
+                thresholdReached(clusterData.avgMemory, outPolicy.memoryThreshold))) {
+            await scaleOut(placementLocations(sample), clusterData.servers);
+            lastActionAt = Date.now();
+            workerStreaks.clear();
+        } else if (Date.now() - lastActionAt >= cooldownMs &&
+            !clusterData.pendingCount &&
+            Number.isInteger(inFlushes) && inFlushes > 0 &&
+            streak.in >= inFlushes &&
+            isScaleInCoordinator(clusterData, inPolicy)) {
+            const result = await scaleIn();
+            if (result) {
+                lastActionAt = Date.now();
+                workerStreaks.clear();
+            }
+        }
+    } catch (error) {
+        console.error('[@cocreate/server-autoscaler] Telemetry evaluation failed:', error);
+    } finally {
+        evaluating = false;
+    }
 }
 
 export async function init(serverInstance) {
@@ -499,6 +974,7 @@ export async function init(serverInstance) {
 
     server = serverInstance;
     await loadAutoscaleConfig();
+    server.on('telemetry', onTelemetry);
 
     console.log("[@cocreate/server-autoscaler] [MASTER] Autoscaler service initialized successfully.");
 
