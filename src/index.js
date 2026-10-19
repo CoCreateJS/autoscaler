@@ -318,9 +318,10 @@ function selectInstanceType(instances = [], targetTier) {
  * datacenterName, countryCode, and geo latency metadata based on client traffic distribution.
  * 
  * @param {Array<Object>} clientLocations - Active client traffic distribution points
+ * @param {Array<Object>} [activeServers] - Cluster snapshot, fetched when omitted
  * @returns {Promise<Object>} Target specification object calculated for scale-out
  */
-export async function determineScaleOutTarget(clientLocations, activeServers = []) {
+export async function determineScaleOutTarget(clientLocations, activeServers) {
     if (!isAutoscalingEnabled()) throw new Error('Autoscaling is disabled.');
     if (!server.cluster_id) throw new Error('Autoscaling requires a cluster ID.');
     if (!allowedApis.length) throw new Error('Autoscaling requires enabled cloud APIs in cluster providers.');
@@ -340,11 +341,12 @@ export async function determineScaleOutTarget(clientLocations, activeServers = [
         }))
     );
 
+    const currentServers = activeServers ?? (await getClusterDetails()).servers;
     const geoTarget = await getCloudProvider(clientLocations, {
         geoScaleByContinent: isGeoEnabled,
         sheddingThreshold,
         cloudProviders,
-        existingNodes: activeServers.map(item => ({
+        existingNodes: currentServers.map(item => ({
             continent: item.location?.continent || item.infrastructure?.continent
         })),
         autoscaleConfig
@@ -357,16 +359,13 @@ export async function determineScaleOutTarget(clientLocations, activeServers = [
     const region = cloudRegion.region;
     const providerInstances = cloudRegion.instances;
 
-    const clusterData = await getClusterDetails();
-    const activeServers = clusterData.servers;
-
     const defaultInstance = providerInstances.find(instance => instance.default);
     if (defaultInstance && (![defaultInstance.vCPU, defaultInstance.memoryGb]
         .every(value => Number.isFinite(Number(value)) && Number(value) > 0))) {
         throw new Error(`The default instance for ${providerType} needs vCPU and memoryGb.`);
     }
     const targetTier = getValueFromObject(autoscaleConfig, 'vertical.enabled') === true
-        ? determineTargetTier(region, activeServers)
+        ? determineTargetTier(region, currentServers)
         : defaultInstance && {
             vCPU: Number(defaultInstance.vCPU),
             memoryGb: Number(defaultInstance.memoryGb),
@@ -409,9 +408,10 @@ export async function determineScaleOutTarget(clientLocations, activeServers = [
  * 3. Dispatches instance creation API call via server.api.send.
  * 
  * @param {Array<Object>} clientLocations - Active client traffic location points
+ * @param {Array<Object>} [activeServers] - Cluster snapshot, fetched when omitted
  * @returns {Promise<Object>} API execution result payload
  */
-export async function scaleOut(clientLocations, activeServers = []) {
+export async function scaleOut(clientLocations, activeServers) {
     const target = await determineScaleOutTarget(clientLocations, activeServers);
     const provider = target.provider;
     const providerType = target.providerType;
