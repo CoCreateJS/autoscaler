@@ -432,32 +432,9 @@ export async function scaleOut(clientLocations, activeServers) {
         throw new Error('Scale-out requires a binary URL and deployment host.');
     }
 
-    const bootstrapStorage = await config.get('storage');
-    const storageId = getValueFromObject(autoscaleConfig, 'storageProvider');
-    let storage = bootstrapStorage;
-    if (storageId) {
-        const storageResponse = await server.crud.send({
-            method: 'object.read',
-            array: 'apis',
-            filter: { query: { _id: storageId, type: 'storage', enabled: true }, limit: 1 },
-            organization_id: server.organization_id,
-            host: server.host
-        });
-        if (storageResponse?.error?.length) throw new Error('Unable to read the cluster storage API.');
-        const storageApi = storageResponse?.object?.[0];
-        if (!storageApi) throw new Error('The cluster storage API is unavailable.');
-        const credentials = { ...storageApi };
-        for (const field of [
-            '_id', 'description', 'enabled', 'type', 'created', 'modified',
-            'organization_id', 'host', 'server', 'worker', 'cluster'
-        ]) delete credentials[field];
-        const hasCredentials = Object.entries(credentials).some(([key, value]) =>
-            !['name', 'provider'].includes(key) && value !== '' && value != null
-        );
-        if (hasCredentials) storage = { [storageApi.name]: credentials };
-    }
-    if (!storage || !Object.keys(storage).length) {
-        throw new Error('Scale-out requires bootstrap or cluster storage configuration.');
+    const storageId = getValueFromObject(autoscaleConfig, 'storage');
+    if (typeof storageId !== 'string' || !storageId.trim()) {
+        throw new Error('Scale-out requires the cluster storage API record ID.');
     }
 
     const serverId = ObjectId().toString();
@@ -511,7 +488,7 @@ export async function scaleOut(clientLocations, activeServers) {
             host: deploymentHost,
             binaryUrl,
             environment: `server_id=${serverId}\ncluster_id=${server.cluster_id}`,
-            storage: Buffer.from(JSON.stringify(storage)).toString('base64'),
+            storage: storageId,
             spot,
             startupScript,
             os,
