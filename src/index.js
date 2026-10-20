@@ -18,7 +18,7 @@
 
 import cluster from 'node:cluster';
 import config from '@cocreate/config';
-import { ObjectId, getValueFromObject, dotNotationToObject } from '@cocreate/utils';
+import { ObjectId, getValueFromObject, dotNotationToObject, uuid } from '@cocreate/utils';
 import { getCloudProvider, loadCloudProviders } from './geoScaling.js';
 
 // Guard clause verification to ensure cluster API abstraction integrity
@@ -28,6 +28,7 @@ let server = null;
 
 let autoscaleConfig = {};
 let allowedApis = [];
+let clusterHost;
 const workerStreaks = new Map();
 let evaluating = false;
 let lastActionAt = 0;
@@ -49,6 +50,8 @@ function isAutoscalingEnabled() {
  */
 export async function loadAutoscaleConfig() {
     const resolved = {};
+    let clusterCloudIds;
+    clusterHost = undefined;
     if (server.id) {
         const response = await server.crud.send({
             method: 'object.read',
@@ -68,7 +71,13 @@ export async function loadAutoscaleConfig() {
             filter: { query: { _id: server.cluster_id }, limit: 1 }
         });
         const clusterConfig = response?.object?.[0];
-        if (clusterConfig) dotNotationToObject(clusterConfig, resolved);
+        if (clusterConfig) {
+            // Keep the cluster's cloud API IDs separate from `clouds.<name>`
+            // autoscaler settings merged below.
+            clusterCloudIds = clusterConfig.clouds ?? clusterConfig.providers;
+            clusterHost = clusterConfig.host;
+            dotNotationToObject(clusterConfig, resolved);
+        }
     }
 
     const sysConfig = await config.get('autoscaler');
@@ -84,7 +93,10 @@ export async function loadAutoscaleConfig() {
     if (sysConfig) dotNotationToObject(sysConfig, resolved);
     if (dbConfig) dotNotationToObject(dbConfig, resolved);
 
-    const providerIds = resolved.providers;
+    // `clouds` is the current cluster field. Fall back to `providers` for
+    // existing cluster records until they are migrated. The IDs are captured
+    // before merging `clouds.<name>` autoscaler settings into `resolved`.
+    const providerIds = clusterCloudIds;
     allowedApis = [];
     if (Array.isArray(providerIds) && providerIds.length) {
         const responses = await Promise.all(providerIds.map(id => server.crud.send({
@@ -324,7 +336,7 @@ function selectInstanceType(instances = [], targetTier) {
 export async function determineScaleOutTarget(clientLocations, activeServers) {
     if (!isAutoscalingEnabled()) throw new Error('Autoscaling is disabled.');
     if (!server.cluster_id) throw new Error('Autoscaling requires a cluster ID.');
-    if (!allowedApis.length) throw new Error('Autoscaling requires enabled cloud APIs in cluster providers.');
+    if (!allowedApis.length) throw new Error('Autoscaling requires enabled cloud APIs in cluster clouds.');
 
     const isGeoEnabled = getValueFromObject(autoscaleConfig, 'geoScale.enabled');
     const sheddingThreshold = getValueFromObject(autoscaleConfig, 'geoScale.sheddingThreshold');
@@ -427,7 +439,7 @@ export async function scaleOut(clientLocations, activeServers) {
     if (!endpoint) throw new Error(`No create endpoint is configured for ${providerType}.`);
     if (!startupScript) throw new Error('Scale-out requires a startup script.');
     const binaryUrl = getValueFromObject(autoscaleConfig, 'binaryUrl');
-    const deploymentHost = getValueFromObject(autoscaleConfig, 'host') || server.host;
+    const deploymentHost = clusterHost || getValueFromObject(autoscaleConfig, 'host') || server.host;
     if (!binaryUrl || !deploymentHost) {
         throw new Error('Scale-out requires a binary URL and deployment host.');
     }
@@ -438,15 +450,18 @@ export async function scaleOut(clientLocations, activeServers) {
     }
 
     const serverId = ObjectId().toString();
+    const clusterName = getValueFromObject(autoscaleConfig, 'name');
+    const serverName = `${clusterName}-${target.provider}-${target.region}-${uuid(6)}`;
     const newServer = {
         _id: serverId,
+        name: serverName,
         cluster_id: server.cluster_id,
-        api_id: target.apiId,
-        host: server.host,
+        cloud: target.apiId,
+        storage: storageId,
+        host: deploymentHost,
         totalWorkers: 0,
         master: { status: 'provisioning' },
         infrastructure: {
-            api_id: target.apiId,
             provider: providerType,
             region: target.region,
             vmType: target.instanceType,
@@ -476,7 +491,7 @@ export async function scaleOut(clientLocations, activeServers) {
         region: target.region,
         data: {
             provider: providerType,
-            api_id: target.apiId,
+            cloud: target.apiId,
             region: target.region,
             vmType: target.instanceType,
             vCPU: target.vCPU,
@@ -484,6 +499,7 @@ export async function scaleOut(clientLocations, activeServers) {
             datacenterName: target.datacenterName,
             countryCode: target.countryCode,
             cluster_id: server.cluster_id,
+            name: serverName,
             server_id: serverId,
             host: deploymentHost,
             binaryUrl,
@@ -713,9 +729,10 @@ export async function scaleIn(targetServer) {
         throw new Error('The server is outside the current cluster.');
     }
 
-    const apiId = candidateServer.api_id || candidateServer.infrastructure?.api_id;
+    const apiId = candidateServer.cloud || candidateServer.infrastructure?.cloud ||
+        candidateServer.api_id || candidateServer.infrastructure?.api_id;
     const api = allowedApis.find(item => String(item._id) === String(apiId));
-    if (!api) throw new Error('The server API is not allowed by the cluster providers.');
+    if (!api) throw new Error('The server cloud API is not allowed by the cluster clouds.');
     const provider = api.name;
     const vmId = candidateServer.infrastructure?.vmId || candidateServer.vmId;
     const region = candidateServer.infrastructure?.region || candidateServer.region;

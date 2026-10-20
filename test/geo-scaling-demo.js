@@ -1,4 +1,4 @@
-import getCloudProvider from './geoScaling.js';
+import getCloudProvider from '../src/geoScaling.js';
 
 /**
  * Mock dataset of active client connections with geographic telemetry
