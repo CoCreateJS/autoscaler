@@ -13,7 +13,7 @@ Fork the [project on Github](https://github.com/CoCreate-app/CoCreate-url-upload
 ```
 git clone https://github.com/contributor/CoCreate-url-uploader.git
 cd CoCreate-url-uploader
-git remote add upstream https://gitlab.com/cocreatejs/CoCreate-url-uploader.git
+git remote add upstream https://github.com/cocreatejs/CoCreate-url-uploader.git
 ```
 
 ## Create a Topic Branch
