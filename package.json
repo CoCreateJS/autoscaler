@@ -60,6 +60,7 @@
   "type": "module",
   "main": "./src/index.js",
   "dependencies": {
-    "@cocreate/config": "^1.21.0"
+    "@cocreate/config": "^1.21.0",
+    "@cocreate/utils": "^1.52.0"
   }
 }
