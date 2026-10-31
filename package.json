@@ -50,9 +50,9 @@
   "author": "CoCreate LLC",
   "license": "AGPL-3.0",
   "bugs": {
-    "url": "https://github.com/CoCreate-app/CoCreate-server-autoscaler/issues"
+    "url": "https://github.com/CoCreateJS/CoCreate-server-autoscaler/issues"
   },
-  "homepage": "https://cocreate.app/docs/server-autoscaler",
+  "homepage": "https://CoCreateJS.com/docs/server-autoscaler",
   "funding": {
     "type": "GitHub Sponsors ❤",
     "url": "https://github.com/sponsors/CoCreate-app"
