@@ -42,11 +42,13 @@ function isAutoscalingEnabled() {
 /**
  * Uses this server's cluster as the baseline, then applies matching system and
  * servers_config records in their configured order.
- * 
+ *
  * Autoscaler is the sole module responsible for loading and resolving configuration early
  * in the pipeline before passing the resolved object to downstream modules like GeoScaling.
- * 
+ *
  * @returns {Promise<Object>} The resolved autoscale configuration
+ * @public
+ * @environment server
  */
 export async function loadAutoscaleConfig() {
     const resolved = {};
@@ -115,9 +117,11 @@ export async function loadAutoscaleConfig() {
 
 /**
  * Queries the database via CRUD for active servers matching given filter query where master is running.
- * 
+ *
  * @param {Object} [query={}] - Optional query filters to merge with default master status
  * @returns {Promise<Object>} Cluster snapshot including averages and raw active servers array
+ * @private
+ * @environment server
  */
 async function getClusterDetails(query = {}, currentSample) {
     const readResponse = await server.crud.send({
@@ -207,10 +211,12 @@ async function getClusterDetails(query = {}, currentSample) {
  * Evaluates the vertical tiering policy and determines the target resource requirements
  * for scaling out in a region. After maxNodesPerTier nodes exist at the current size,
  * the next size doubles vCPU and memory without exceeding the configured maximum.
- * 
+ *
  * @param {string} targetRegion - Target region identifier (e.g. 'us-east-1')
  * @param {Array<Object>} activeClusterServers - Active servers running in cluster
  * @returns {Object} Target tier specifications { vCPU, memoryGb, tierIndex }
+ * @private
+ * @environment server
  */
 function determineTargetTier(targetRegion, activeClusterServers) {
     const minimum = getValueFromObject(autoscaleConfig, 'vertical.min') || {};
@@ -300,10 +306,12 @@ function determineTargetTier(targetRegion, activeClusterServers) {
 /**
  * Searches the provider's `instances` array (returned by geoScaling) for an instance name
  * that best matches or satisfies the target tier's vCPU and memory specifications.
- * 
+ *
  * @param {Array<Object>} instances - Instance catalog array from cloud provider config
  * @param {Object} targetTier - Target tier specifications { vCPU, memoryGb }
  * @returns {string} Matching instance type string (e.g. 't3a.medium', 'e2-standard-4')
+ * @private
+ * @environment server
  */
 function selectInstanceType(instances = [], targetTier) {
     const requiredCpu = targetTier.vCPU;
@@ -328,10 +336,12 @@ function selectInstanceType(instances = [], targetTier) {
 /**
  * Calculates scale-out targeting details: provider, region, instanceType, vCPU, memoryGb,
  * datacenterName, countryCode, and geo latency metadata based on client traffic distribution.
- * 
+ *
  * @param {Array<Object>} clientLocations - Active client traffic distribution points
  * @param {Array<Object>} [activeServers] - Cluster snapshot, fetched when omitted
  * @returns {Promise<Object>} Target specification object calculated for scale-out
+ * @public
+ * @environment server
  */
 export async function determineScaleOutTarget(clientLocations, activeServers) {
     if (!isAutoscalingEnabled()) throw new Error('Autoscaling is disabled.');
@@ -418,10 +428,12 @@ export async function determineScaleOutTarget(clientLocations, activeServers) {
  * 1. Computes optimal cloud provider, region, instance type, vCPU, memory, datacenter, and country code via determineScaleOutTarget.
  * 2. Fetches static configurations (spot, startupScript, os, application, create endpoint) directly from autoscaleConfig.
  * 3. Dispatches instance creation API call via server.api.send.
- * 
+ *
  * @param {Array<Object>} clientLocations - Active client traffic location points
  * @param {Array<Object>} [activeServers] - Cluster snapshot, fetched when omitted
  * @returns {Promise<Object>} API execution result payload
+ * @public
+ * @environment server
  */
 export async function scaleOut(clientLocations, activeServers) {
     const target = await determineScaleOutTarget(clientLocations, activeServers);
@@ -534,9 +546,11 @@ export async function scaleOut(clientLocations, activeServers) {
 /**
  * Evaluates active cluster servers against autoscale scale-in policies to determine
  * which server candidate should be decommissioned (dry-run preview).
- * 
+ *
  * @param {Object} [options] - Optional override parameters
  * @returns {Promise<Object>} Evaluation result containing selected candidate server and reason
+ * @public
+ * @environment server
  */
 export async function determineScaleInTarget(options) {
     if (!isAutoscalingEnabled()) {
@@ -698,9 +712,11 @@ async function sendDrain(serverId, value) {
 /**
  * Removes a node after verifying projected capacity, draining it, and observing
  * fresh telemetry from the remaining cluster nodes.
- * 
+ *
  * @param {Object} [targetServer] - Optional target server document to decommission
  * @returns {Promise<Object>} API execution result payload
+ * @public
+ * @environment server
  */
 export async function scaleIn(targetServer) {
     if (!isAutoscalingEnabled()) throw new Error('Autoscaling is disabled.');
@@ -866,7 +882,9 @@ function placementLocations(sample) {
     }] : [];
 }
 
-/** Evaluate local flushes first. Only a sustained local signal reads peer telemetry. */
+/** Evaluate local flushes first. Only a sustained local signal reads peer telemetry.  * @private
+ * @environment server
+ */
 async function onTelemetry(message) {
     if (!isAutoscalingEnabled() || !server.cluster_id) return;
     const sample = message?.data;
@@ -961,6 +979,11 @@ async function onTelemetry(message) {
     }
 }
 
+/**
+ *
+ * @public
+ * @environment server
+ */
 export async function init(serverInstance) {
     if (!isPrimary) {
         return;
@@ -984,3 +1007,10 @@ export async function init(serverInstance) {
 export default {
     init
 };
+
+/**
+ * Decentralized, masterless P2P autoscaling engine for CoCreate Server. Executes autonomous horizontal and vertical multi-cloud adjustments driven by real-time tenant telemetry.
+ *
+ * @module server-autoscaler
+ * @environment server
+ */
