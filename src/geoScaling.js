@@ -80,7 +80,7 @@ export function loadCloudProviders(autoscaleConfigOrClouds = null) {
 
         return flattenedRegions;
     } catch (err) {
-        console.error("[@cocreate/server-autoscaler] Error processing cloud providers from autoscale config:", err.message);
+        console.error("[@cocreate/autoscaler] Error processing cloud providers from autoscale config:", err.message);
         return [];
     }
 }
@@ -218,7 +218,7 @@ export function calculateWeightedCentroid(clients) {
  */
 export function getCloudProvider(clients, options = {}) {
     if (!clients || clients.length === 0) {
-        console.log("[@cocreate/server-autoscaler] [GEO-SCALING] No active client location data provided.");
+        console.log("[@cocreate/autoscaler] [GEO-SCALING] No active client location data provided.");
         return null;
     }
 
@@ -278,7 +278,7 @@ export function getCloudProvider(clients, options = {}) {
         if (!hasServer && percentage >= sheddingThresholdPct) {
             targetContinentData = cont;
             isSheddingTarget = true;
-            console.log(`[@cocreate/server-autoscaler] [GEO-SCALING] [SHEDDING TRIGGERED] Targeting new continent [${cont.continent}] representing ${percentage.toFixed(1)}% of total load.`);
+            console.log(`[@cocreate/autoscaler] [GEO-SCALING] [SHEDDING TRIGGERED] Targeting new continent [${cont.continent}] representing ${percentage.toFixed(1)}% of total load.`);
             break;
         }
     }

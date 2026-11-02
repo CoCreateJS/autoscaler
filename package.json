@@ -1,5 +1,5 @@
 {
-  "name": "@cocreate/server-autoscaler",
+  "name": "@cocreate/autoscaler",
   "version": "1.6.0",
   "description": "Decentralized, masterless P2P autoscaling engine for CoCreate Server. Executes autonomous horizontal and vertical multi-cloud adjustments driven by real-time tenant telemetry.",
   "keywords": [
@@ -25,14 +25,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cocreatejs/CoCreate-server-autoscaler.git"
+    "url": "git+https://github.com/CoCreateJS/autoscaler.git"
   },
   "author": "CoCreate LLC",
   "license": "AGPL-3.0",
   "bugs": {
-    "url": "https://github.com/CoCreateJS/CoCreate-server-autoscaler/issues"
+    "url": "https://github.com/CoCreateJS/autoscaler/issues"
   },
-  "homepage": "https://CoCreateJS.com/docs/server-autoscaler",
+  "homepage": "https://CoCreateJS.com/docs/autoscaler",
   "funding": {
     "type": "GitHub Sponsors ❤",
     "url": "https://github.com/sponsors/CoCreate-app"

@@ -298,7 +298,7 @@ function determineTargetTier(targetRegion, activeClusterServers) {
     const nextTierIndex = currentTierIndex + (
         nextTier.vCPU !== currentTier.vCPU || nextTier.memoryGb !== currentTier.memoryGb ? 1 : 0
     );
-    console.log(`[@cocreate/server-autoscaler] [VERTICAL TIERING] Region [${targetRegion}] reached ${nodesAtCurrentTier}/${maxNodesPerTier} nodes at tier ${currentTierIndex}. Stepping up to tier ${nextTierIndex} (${nextTier.vCPU} vCPU, ${nextTier.memoryGb}GB RAM).`);
+    console.log(`[@cocreate/autoscaler] [VERTICAL TIERING] Region [${targetRegion}] reached ${nodesAtCurrentTier}/${maxNodesPerTier} nodes at tier ${currentTierIndex}. Stepping up to tier ${nextTierIndex} (${nextTier.vCPU} vCPU, ${nextTier.memoryGb}GB RAM).`);
 
     return { ...nextTier, tierIndex: nextTierIndex };
 }
@@ -419,7 +419,7 @@ export async function determineScaleOutTarget(clientLocations, activeServers) {
         timestamp: Date.now()
     };
 
-    console.log("[@cocreate/server-autoscaler] Resolved scale-out target decision:", JSON.stringify(result, null, 2));
+    console.log("[@cocreate/autoscaler] Resolved scale-out target decision:", JSON.stringify(result, null, 2));
     return result;
 }
 
@@ -492,7 +492,7 @@ export async function scaleOut(clientLocations, activeServers) {
         throw new Error('Unable to reserve a server record for scale-out.');
     }
 
-    console.log(`[@cocreate/server-autoscaler] [SCALE-OUT] Sending instance creation API request for provider [${provider}] on endpoint [${endpoint}] in region [${target.region}]...`);
+    console.log(`[@cocreate/autoscaler] [SCALE-OUT] Sending instance creation API request for provider [${provider}] on endpoint [${endpoint}] in region [${target.region}]...`);
 
     const apiPayload = {
         api: provider,
@@ -529,7 +529,7 @@ export async function scaleOut(clientLocations, activeServers) {
         if (response?.error?.length || response?.success === false) {
             throw new Error('The cloud API rejected the scale-out request.');
         }
-        console.log(`[@cocreate/server-autoscaler] [SCALE-OUT] Provisioning server ${serverId}.`);
+        console.log(`[@cocreate/autoscaler] [SCALE-OUT] Provisioning server ${serverId}.`);
         return response;
     } catch (error) {
         await server.crud.send({
@@ -575,7 +575,7 @@ export async function determineScaleInTarget(options) {
     }
 
     if (activeServers.length <= minSize) {
-        console.log(`[@cocreate/server-autoscaler] [SCALE-IN PREVIEW] Cannot scale in: Active nodes (${activeServers.length}) is at or below cluster floor (${minSize}).`);
+        console.log(`[@cocreate/autoscaler] [SCALE-IN PREVIEW] Cannot scale in: Active nodes (${activeServers.length}) is at or below cluster floor (${minSize}).`);
         return {
             canScaleIn: false,
             reason: `Cluster size (${activeServers.length}) is at or below minimum floor (${minSize}).`,
@@ -738,7 +738,7 @@ export async function scaleIn(targetServer) {
     }
 
     if (!candidateServer) {
-        console.log("[@cocreate/server-autoscaler] [SCALE-IN] Aborted: No valid scale-in candidate server found.");
+        console.log("[@cocreate/autoscaler] [SCALE-IN] Aborted: No valid scale-in candidate server found.");
         return null;
     }
     if (String(candidateServer.cluster_id) !== String(server.cluster_id)) {
@@ -771,11 +771,11 @@ export async function scaleIn(targetServer) {
     }
     const projected = checkScaleInCapacity(before, candidateServer._id);
     if (!projected.ok) {
-        console.log(`[@cocreate/server-autoscaler] [SCALE-IN] ${projected.reason}`);
+        console.log(`[@cocreate/autoscaler] [SCALE-IN] ${projected.reason}`);
         return null;
     }
 
-    console.log(`[@cocreate/server-autoscaler] [SCALE-IN] Draining node [${vmId}] before provider [${provider}] termination.`);
+    console.log(`[@cocreate/autoscaler] [SCALE-IN] Draining node [${vmId}] before provider [${provider}] termination.`);
 
     const apiPayload = {
         api: provider,
@@ -810,7 +810,7 @@ export async function scaleIn(targetServer) {
         }
         if (!observed?.ok) throw new Error(observed?.reason || 'Scale-in capacity check failed.');
 
-        console.log(`[@cocreate/server-autoscaler] [SCALE-IN] Sending termination request for node [${vmId}] to provider [${provider}] endpoint [${endpoint}].`);
+        console.log(`[@cocreate/autoscaler] [SCALE-IN] Sending termination request for node [${vmId}] to provider [${provider}] endpoint [${endpoint}].`);
         const response = await server.api.send(apiPayload);
         if (response?.error?.length || response?.success === false) {
             throw new Error('The cloud API rejected the termination request.');
@@ -818,7 +818,7 @@ export async function scaleIn(targetServer) {
         try {
             await setDecommission(candidateServer._id, 'terminating', startedAt);
         } catch (error) {
-            console.error('[@cocreate/server-autoscaler] Could not record termination state:', error);
+            console.error('[@cocreate/autoscaler] Could not record termination state:', error);
         }
         return response;
     } catch (error) {
@@ -826,13 +826,13 @@ export async function scaleIn(targetServer) {
             try {
                 await sendDrain(candidateServer._id, false);
             } catch (restoreError) {
-                console.error('[@cocreate/server-autoscaler] Could not restore the drained server:', restoreError);
+                console.error('[@cocreate/autoscaler] Could not restore the drained server:', restoreError);
             }
         }
         try {
             await setDecommission(candidateServer._id, 'cancelled', startedAt);
         } catch (stateError) {
-            console.error('[@cocreate/server-autoscaler] Could not cancel decommission state:', stateError);
+            console.error('[@cocreate/autoscaler] Could not cancel decommission state:', stateError);
         }
         throw error;
     }
@@ -973,7 +973,7 @@ async function onTelemetry(message) {
             }
         }
     } catch (error) {
-        console.error('[@cocreate/server-autoscaler] Telemetry evaluation failed:', error);
+        console.error('[@cocreate/autoscaler] Telemetry evaluation failed:', error);
     } finally {
         evaluating = false;
     }
@@ -993,7 +993,7 @@ export async function init(serverInstance) {
     await loadAutoscaleConfig();
     server.on('telemetry', onTelemetry);
 
-    console.log("[@cocreate/server-autoscaler] [MASTER] Autoscaler service initialized successfully.");
+    console.log("[@cocreate/autoscaler] [MASTER] Autoscaler service initialized successfully.");
 
     return {
         config: autoscaleConfig,
@@ -1011,6 +1011,6 @@ export default {
 /**
  * Decentralized, masterless P2P autoscaling engine for CoCreate Server. Executes autonomous horizontal and vertical multi-cloud adjustments driven by real-time tenant telemetry.
  *
- * @module server-autoscaler
+ * @module autoscaler
  * @environment server
  */

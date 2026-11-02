@@ -6,12 +6,12 @@ A decentralized, self-healing, and autonomous cluster lifecycle manager designed
 
 ## Documentation
 
-For advanced cloud provider configurations, identity IAM role policies, and threshold triggers, refer to the [CoCreate Server Autoscaler Documentation](https://cocreatejs.com/docs/server-autoscaler).
+For advanced cloud provider configurations, identity IAM role policies, and threshold triggers, refer to the [CoCreate Server Autoscaler Documentation](https://cocreatejs.com/docs/autoscaler).
 
 ## Table of Contents
 
 * [The Masterless Replicating Node Architecture](#the-masterless-replicating-node-architecture)
-* [Why CoCreate Server Autoscaler?](#why-cocreate-server-autoscaler)
+* [Why CoCreate Server Autoscaler?](#why-cocreate-autoscaler)
 * [Vertical & Horizontal Multi-Cloud Adaptability](#vertical--horizontal-multi-cloud-adaptability)
 * [Self-Healing & Telemetry-Driven Lifecycle](#self-healing--telemetry-driven-lifecycle)
 * [Cooperative Draining & Scale-Down Sequence](#cooperative-draining--scale-down-sequence)
@@ -28,7 +28,7 @@ For advanced cloud provider configurations, identity IAM role policies, and thre
 
 Traditional autoscaling relies on a centralized coordinator or a dedicated third-party master server (like a Kubernetes Control Plane or a custom Orchestrator VM) to monitor worker health and issue creation commands. If that master node crashes, the entire cluster's scaling capabilities freeze.
 
-`@cocreate/server-autoscaler` implements a **Decentralized, Peer-to-Peer (P2P) Replication Model**:
+`@cocreate/autoscaler` implements a **Decentralized, Peer-to-Peer (P2P) Replication Model**:
 
 * **Every Node is Both Master and Worker:** There are no specialized roles. Each node independently monitors its own resource limits, registers its state within the shared platform database, and monitors peer health via the `@cocreate/server-mesh` Control Plane.
 * **Autonomous Self-Replication:** If a node detects cluster-wide saturation or localized system boundaries, it doesn't wait for a central master to act. It directly contacts your cloud provider's API to clone its own VM image, dynamically spawning an exact sibling node to scale out immediately:
@@ -41,7 +41,7 @@ $$\text{Resource Boundary Tripped} \implies \text{Node } A \xrightarrow{\text{Di
 
 ## Why CoCreate Server Autoscaler?
 
-Unlike standard cloud-native autoscaling groups (like AWS ASGs) that only monitor generic hypervisor metrics like raw CPU and ignore application-level boundaries, `@cocreate/server-autoscaler` is tightly integrated with the CoCreate core.
+Unlike standard cloud-native autoscaling groups (like AWS ASGs) that only monitor generic hypervisor metrics like raw CPU and ignore application-level boundaries, `@cocreate/autoscaler` is tightly integrated with the CoCreate core.
 
 It understands **Multi-Tenant Boundaries** and **WebSocket Connection States**. It makes scaling decisions based on real-time transaction lag, active user session counts, and memory footprints rather than inaccurate system-level averages.
 
@@ -65,7 +65,7 @@ The autoscaler features a robust, pluggable **Cloud Adapter Plane** that support
 
 ## Self-Healing & Telemetry-Driven Lifecycle
 
-The autoscaler connects directly to the local `@cocreate/server-telemetry` Data Engine pipeline. It processes system telemetry metrics to continuously calculate a weighted saturation index:
+The autoscaler connects directly to the local `@cocreate/telemetry` Data Engine pipeline. It processes system telemetry metrics to continuously calculate a weighted saturation index:
 
 $$\text{Saturation Index} = \alpha \cdot \text{V8 CPU Lag} + \beta \cdot \text{RAM Utilization} + \gamma \cdot \text{Socket Density}$$
 
@@ -148,20 +148,20 @@ Unrecognized strategy values safely fall back to `oldest`.
 You can install this package locally via npm:
 
 ```bash
-npm i @cocreate/server-autoscaler
+npm i @cocreate/autoscaler
 ```
 
 Or via yarn:
 
 ```bash
-yarn add @cocreate/server-autoscaler
+yarn add @cocreate/autoscaler
 ```
 
 ---
 
 ## Announcements
 
-All scaling adaptations, cloud adapter API patches, and metric evaluation revisions are tracked inside our release logs on the [CoCreate Server Autoscaler GitHub Releases](https://github.com/CoCreateJS/CoCreate-server-autoscaler/releases) page. Please subscribe to our release notifications for breaking updates on cloud provider parameters.
+All scaling adaptations, cloud adapter API patches, and metric evaluation revisions are tracked inside our release logs on the [CoCreate Server Autoscaler GitHub Releases](https://github.com/CoCreateJS/autoscaler/releases) page. Please subscribe to our release notifications for breaking updates on cloud provider parameters.
 
 ---
 
@@ -176,17 +176,17 @@ Upcoming enhancements planned for our autonomous scaling system include:
 
 ## How to Contribute
 
-We encourage contribution to our libraries (you might even score some nifty swag), please see our [CONTRIBUTING.md](https://github.com/CoCreateJS/CoCreate-server-autoscaler/blob/master/CONTRIBUTING.md) guide for details. If you encounter any bugs or wish to make feature requests, please submit an issue on our [GitHub Issues](https://github.com/CoCreateJS/CoCreate-server-autoscaler/issues) tracker. We want this library to be community-driven, and CoCreate led. We need your help to realize this goal.
+We encourage contribution to our libraries (you might even score some nifty swag), please see our [CONTRIBUTING.md](https://github.com/CoCreateJS/autoscaler/blob/master/CONTRIBUTING.md) guide for details. If you encounter any bugs or wish to make feature requests, please submit an issue on our [GitHub Issues](https://github.com/CoCreateJS/autoscaler/issues) tracker. We want this library to be community-driven, and CoCreate led. We need your help to realize this goal.
 
-For broader system configurations and API guides, please visit our [CoCreate Server Autoscaler Documentation](https://cocreatejs.com/docs/server-autoscaler).
+For broader system configurations and API guides, please visit our [CoCreate Server Autoscaler Documentation](https://cocreatejs.com/docs/autoscaler).
 
 ---
 
 ## About
 
-`@cocreate/server-autoscaler` is designed, built, and supported by the CoCreate Developer Experience Team.
+`@cocreate/autoscaler` is designed, built, and supported by the CoCreate Developer Experience Team.
 
 > [!NOTE]
-> Please contact the Developer Experience Team via [GitHub Discussions](https://github.com/CoCreateJS/CoCreate-server-autoscaler/discussions) or join our Discord channel for any architecture or deployment queries.
+> Please contact the Developer Experience Team via [GitHub Discussions](https://github.com/CoCreateJS/autoscaler/discussions) or join our Discord channel for any architecture or deployment queries.
 
-`@cocreate/server-autoscaler` is maintained and funded by CoCreate. The names and logos for CoCreate are trademarks of CoCreate, LLC.
+`@cocreate/autoscaler` is maintained and funded by CoCreate. The names and logos for CoCreate are trademarks of CoCreate, LLC.
