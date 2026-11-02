@@ -1,3 +1,15 @@
+# [2.0.0](https://github.com/CoCreateJS/autoscaler/compare/v1.1.0...v2.0.0) (2026-11-02)
+
+
+### Features
+
+* align CoCreate repository and package naming ([4f54008](https://github.com/CoCreateJS/autoscaler/commit/4f54008114584ba543293b5701935c6f0302798a))
+
+
+### BREAKING CHANGES
+
+* consumers must use the renamed CoCreate package and repository identities; the previous prefixed names are no longer supported.
+
 # [1.1.0](https://github.com/CoCreateJS/autoscaler/compare/v1.0.2...v1.1.0) (2026-11-02)
 
 
