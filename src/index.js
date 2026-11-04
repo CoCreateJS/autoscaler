@@ -677,6 +677,7 @@ function checkScaleInCapacity(snapshot, candidateId, observedAfter) {
         }
     }
     if (!cpuCapacity || !memoryCapacity) {
+        if (minimum === 0 && remaining.length === 0) return { ok: true };
         return { ok: false, reason: 'No remaining capacity is available.' };
     }
     if (!observedAfter &&

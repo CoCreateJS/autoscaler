@@ -7,13 +7,20 @@ const start = source.indexOf('export async function scaleOut(');
 const end = source.indexOf('\n/**', start);
 const scaleOut = source.slice(start, end).replace('export async function', 'async function');
 
-async function run(storage = 'storage-id') {
+async function run(storage = 'storage-id', apikey) {
     const requests = [];
     const crudRequests = [];
+    const credentialReads = [];
     const context = vm.createContext({
         autoscaleConfig: { storage, host: 'example.com', startupScript: { $concat: [['script']] }, binaryUrl: 'https://example.com/runtime.tar.gz', endpoint: { create: 'create-instance' } },
         getValueFromObject: (object, path) => path.split('.').reduce((value, key) => value?.[key], object),
-        config: { get() { assert.fail('Autoscaler must not read bootstrap credentials'); } },
+        config: { get(name) {
+            assert.equal(name, 'apikey', 'Unexpected configuration lookup');
+            credentialReads.push(name);
+            return apikey;
+        } },
+        clusterHost: undefined,
+        uuid: () => 'suffix',
         determineScaleOutTarget: async () => ({ provider: 'test-cloud', providerType: 'aws', region: 'example', instanceType: 'small', apiId: 'api-id' }),
         ObjectId: () => ({ toString: () => 'server-id' }),
         console: { log() {}, error() {} },
@@ -32,7 +39,7 @@ async function run(storage = 'storage-id') {
     });
     vm.runInContext(scaleOut, context);
     await context.scaleOut([]);
-    return { requests, crudRequests };
+    return { requests, crudRequests, credentialReads };
 }
 
 test('autoscaler passes the cluster storage ID directly to create-instance', async () => {
@@ -47,4 +54,17 @@ test('autoscaler passes the cluster storage ID directly to create-instance', asy
 test('autoscaler requires a storage ID instead of embedded bootstrap credentials', async () => {
     await assert.rejects(run(''), /storage API record ID/);
     await assert.rejects(run({ name: 'mongo', provider: 'mongodb', connectionString: 'mongodb://example' }), /storage API record ID/);
+});
+
+test('scale-out does not send node API keys to the cloud provider', async () => {
+    const { requests, crudRequests, credentialReads } = await run('storage-id', 'test-only-node-key');
+    assert.deepEqual(credentialReads, [], 'Scale-out must not read the configured node credential');
+    assert.equal(Object.hasOwn(requests[0].data, 'apikey'), false);
+    assert.equal(JSON.stringify(requests).includes('test-only-node-key'), false);
+    assert.equal(JSON.stringify(crudRequests).includes('test-only-node-key'), false);
+});
+
+test('scale-out omits the API key when none is configured', async () => {
+    const { requests } = await run();
+    assert.equal(Object.hasOwn(requests[0].data, 'apikey'), false);
 });
