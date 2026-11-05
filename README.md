@@ -190,3 +190,40 @@ For broader system configurations and API guides, please visit our [CoCreate Ser
 > Please contact the Developer Experience Team via [GitHub Discussions](https://github.com/CoCreateJS/autoscaler/discussions) or join our Discord channel for any architecture or deployment queries.
 
 `@cocreate/autoscaler` is maintained and funded by CoCreate. The names and logos for CoCreate are trademarks of CoCreate, LLC.
+
+## Master status and available capacity
+
+Available capacity and telemetry averages include only running masters. Provisioning is pending capacity. Draining/terminating masters are tracked separately for removal coordination; stopped, failed and terminated masters are excluded. Worker status and drain/cordon flags do not change server eligibility. State.save preserves failed/terminating outcomes by skipping subsequent State saves; scaling policy remains unchanged.
+
+
+### Delayed server inventory cleanup
+
+Initialization schedules an own-cluster sweep every ten minutes, with no startup sweep.
+Retirement commits master.status terminating before the provider API call. Success retains
+that state; failure overrides it with failed. Only terminating records are selected for
+cleanup; failed records remain for investigation, and their Manager update cancels pending
+Manager cleanup directly.
+The shared deleteServer helper removes inventory without another server-status lookup or
+cloud API request. An already-missing record is success. Managed local cleanup also sends
+object.delete servers to Manager for its platform copy; unmanaged cleanup stays local.
+Manager uses the same helper one minute after persisting a terminating report, deleting
+the tenant copy before the platform copy. Manager deletion receipts do not mirror back.
+
+Cleanup helpers receive an explicit server context so Manager workers can use them without
+initializing an AutoScaler instance. Server instances expose deleteServer and
+collectTerminatingServers on server.autoscaler. Timers are process-local; they do not
+provide persistent scheduling or a platform-wide tenant sweep. Initial provisioning
+remains Manager's responsibility, and failed inventory is never selected automatically.
+
+
+### Organization-driven scale-to-zero
+
+Mesh's confirmed organization.inactive event invokes the existing scaleIn operation
+when the organization matches this node, autoscaling is enabled and minClusterSize is
+zero, selecting the local node through the existing selection lookup. Each node retires
+itself; ordinary scaling retains its configured selection strategy. Organization activation clears the idle marker. CPU/memory scale-in alone retains
+the final node. The final idle removal does not require CPU/memory samples when no
+capacity remains; other capacity-change checks still apply. Evaluation already in progress
+can defer the retained idle request until a subsequent telemetry evaluation. No client
+counts or peer registrations are validated again by AutoScaler. Drain, provider termination,
+shutdown and inventory cleanup follow the existing lifecycle.
