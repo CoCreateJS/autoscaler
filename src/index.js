@@ -780,7 +780,7 @@ export async function scaleIn(targetServer, options) {
     const api = allowedApis.find(item => String(item._id) === String(apiId));
     if (!api) throw new Error('The server cloud API is not allowed by the cluster clouds.');
     const provider = api.name;
-    const vmId = candidateServer.infrastructure?.vmId || candidateServer.vmId;
+    const vmId = candidateServer.infrastructure?.instanceId || candidateServer.infrastructure?.vmId || candidateServer.vmId;
     const region = candidateServer.infrastructure?.region || candidateServer.region;
 
     // Retrieve delete endpoint directly from autoscaleConfig
@@ -817,6 +817,7 @@ export async function scaleIn(targetServer, options) {
         region,
         data: {
             server_id: candidateServer._id,
+            cluster_id: server.cluster_id,
             vmId: vmId,
             provider: api.provider,
             region

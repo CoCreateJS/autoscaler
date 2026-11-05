@@ -14,7 +14,7 @@ async function setup(t, { managed = true, reject = false, networkFailures = 0, n
     t.mock.method(config, 'get', () => undefined);
     t.mock.method(config, 'query', async () => undefined);
     const calls = [], order = [], inventoryWrites = [];
-    const candidate = { _id: 'server-1', cluster_id: 'cluster-1', cloud: 'cloud-id', infrastructure: { vmId: 'vm-1', region: 'region-1' } };
+    const candidate = { _id: 'server-1', cluster_id: 'cluster-1', cloud: 'cloud-id', infrastructure: { instanceId: 'vm-1', region: 'region-1' } };
     const server = {
         isPrimary: true, id: 'server-1', organization_id: 'tenant', host: 'tenant.test', cluster_id: 'cluster-1',
         crud: { send: async request => { order.push(request.method); inventoryWrites.push(plain(request.object)); return { object: [request.object] }; } },
@@ -75,6 +75,8 @@ for (const action of ['scaleOut', 'scaleIn']) {
         for (const key of ['organization_id', 'host', 'apikey', 'socket']) assert.equal(inner[key], undefined);
         if (action === 'scaleIn') {
             assert.equal(inner.data.server_id, 'server-1');
+            assert.equal(inner.data.cluster_id, 'cluster-1');
+            assert.equal(inner.data.vmId, 'vm-1');
             assert.ok(order.indexOf('drain:true') < order.indexOf('send'));
             assert.equal(order.filter(item => item === 'capacity').length, 2);
             assert.ok(order.indexOf('terminating') < order.indexOf('send'));
