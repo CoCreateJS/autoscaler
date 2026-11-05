@@ -1,3 +1,17 @@
+# [2.1.0](https://github.com/CoCreateJS/autoscaler/compare/v2.0.0...v2.1.0) (2026-11-05)
+
+
+### Bug Fixes
+
+* allow scale-in to zero when the cluster minimum is zero ([6fbcb44](https://github.com/CoCreateJS/autoscaler/commit/6fbcb44e6684ae05271038db159c1d253ca34193))
+* preserve cluster and provider IDs during scale-in ([b9a7f42](https://github.com/CoCreateJS/autoscaler/commit/b9a7f429dbd75ca00a43453481aa4543818fced5))
+* upgrade CoCreate dependencies to v2 ([01e3efb](https://github.com/CoCreateJS/autoscaler/commit/01e3efb450574bb16230ed578575cb163fc2f1b6))
+
+
+### Features
+
+* scale idle organizations to zero and collect retired servers ([4428ed7](https://github.com/CoCreateJS/autoscaler/commit/4428ed7efdd5ef8ee21353a10b2a11c875192614))
+
 # [2.0.0](https://github.com/CoCreateJS/autoscaler/compare/v1.1.0...v2.0.0) (2026-11-02)
 
 
