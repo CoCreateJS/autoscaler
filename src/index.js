@@ -730,7 +730,7 @@ async function setMasterStatus(serverId, status) {
 }
 
 async function sendDrain(serverId, value) {
-    if (String(serverId) === String(server.id) && server.totalWorkers <= 1) {
+    if (String(serverId) === String(server.id) && server.isWorker) {
         await server.state.drain(value);
     } else {
         await server.send({ method: 'drain', server: serverId, broadcast: true, master: false, value });
@@ -949,7 +949,7 @@ function placementLocations(sample) {
 /** Evaluate local flushes first. Only a sustained local signal reads peer telemetry.  * @private
  * @environment server
  */
-async function onOrganizationInactive(message) {
+async function onOrganizationDisconnected(message) {
     if (message.organization_id !== server.organization_id || !isAutoscalingEnabled() ||
         Number(getValueFromObject(autoscaleConfig, 'scaleIn.minClusterSize')) !== 0) return;
     organizationIdle = true;
@@ -1079,8 +1079,8 @@ export async function init(serverInstance) {
     await loadAutoscaleConfig();
     organizationIdle = false;
     server.on('telemetry', onTelemetry);
-    server.mesh.on('organization.inactive', onOrganizationInactive);
-    server.mesh.on('organization.active', message => {
+    server.on('orgDisconnected', onOrganizationDisconnected);
+    server.on('orgConnected', message => {
         if (message.organization_id === server.organization_id) organizationIdle = false;
     });
     clearInterval(cleanupTimer);
