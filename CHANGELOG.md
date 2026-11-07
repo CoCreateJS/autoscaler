@@ -1,3 +1,10 @@
+## [2.1.2](https://github.com/CoCreateJS/autoscaler/compare/v2.1.1...v2.1.2) (2026-11-07)
+
+
+### Bug Fixes
+
+* bump CoCreate dependency versions ([ddd41a4](https://github.com/CoCreateJS/autoscaler/commit/ddd41a4a0ad217013a95918d311a8699e9946246))
+
 ## [2.1.1](https://github.com/CoCreateJS/autoscaler/compare/v2.1.0...v2.1.1) (2026-11-07)
 
 
