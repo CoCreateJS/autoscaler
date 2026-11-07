@@ -1,3 +1,10 @@
+## [2.1.1](https://github.com/CoCreateJS/autoscaler/compare/v2.1.0...v2.1.1) (2026-11-07)
+
+
+### Bug Fixes
+
+* consume unified organization presence events ([19c147d](https://github.com/CoCreateJS/autoscaler/commit/19c147d1b21e67b8c0675f567307dc05e7c839eb))
+
 # [2.1.0](https://github.com/CoCreateJS/autoscaler/compare/v2.0.0...v2.1.0) (2026-11-05)
 
 
