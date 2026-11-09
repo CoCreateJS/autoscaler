@@ -476,7 +476,6 @@ export async function scaleOut(clientLocations, activeServers) {
         _id: serverId,
         name: serverName,
         cluster_id: server.cluster_id,
-        ...(server.manager?.organization_id && { manager: { ...server.manager } }),
         cloud: target.apiId,
         storage: storageId,
         host: deploymentHost,
