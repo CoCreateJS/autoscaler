@@ -6,17 +6,18 @@ export async function deleteServer(server, serverId, {
     scopes = [{ organization_id: server.organization_id, host: server.host }],
     notifyManager = true
 } = {}) {
+    const payload = {
+        method: 'object.delete', array: 'servers', object: [{ _id: serverId }],
+        organization_id: server.organization_id, host: server.host
+    };
     let result;
     for (const scope of scopes) {
-        result = await server.crud.send({
-            method: 'object.delete', array: 'servers', object: [{ _id: serverId }], ...scope
-        });
+        // CRUD resolves database/storage on its input; keep that local to this scope.
+        result = await server.crud.send({ ...payload, ...scope });
         if (failed(result)) throw new Error(`Unable to delete server inventory ${serverId}.`);
     }
     if (notifyManager && server.manager?.organization_id) {
-        const mirrored = await server.manager.send({
-            method: 'object.delete', array: 'servers', object: { _id: serverId }
-        });
+        const mirrored = await server.manager.send(payload);
         if (failed(mirrored)) throw new Error(`Unable to delete managed server inventory ${serverId}.`);
     }
     return result;

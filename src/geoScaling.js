@@ -108,6 +108,53 @@ export function calculateHaversineDistance(latitude1, longitude1, latitude2, lon
     return R * c;
 }
 
+/** Flatten normalized DNS catalogs while retaining provider and location identity. */
+export function loadDnsLocations(dns = {}) {
+    if (!dns || typeof dns !== 'object' || Array.isArray(dns)) return [];
+    return Object.entries(dns).flatMap(([provider, locations]) =>
+        locations.filter(location => location.enabled !== false &&
+            location.allowLatencyRouting !== false &&
+            Number.isFinite(location.latitude) && Number.isFinite(location.longitude))
+            .map(location => ({ ...location, provider }))
+    );
+}
+
+/** Select one POP per DNS connection (or provider for raw catalogs) and order them by their exact distance from demand. */
+export function findNearestDnsLocations(latitude, longitude, locations) {
+    const nearestByProvider = new Map();
+    for (const location of locations) {
+        const distance = calculateHaversineDistance(latitude, longitude, location.latitude, location.longitude);
+        const connection = location.apiId || location.provider;
+        const nearest = nearestByProvider.get(connection);
+        if (!nearest || distance < nearest.distance) {
+            nearestByProvider.set(connection, { location, distance });
+        }
+    }
+    return [...nearestByProvider.values()]
+        .sort((a, b) => a.distance - b.distance)
+        .map(({ location, distance }) => ({ ...location, distanceKm: Math.round(distance) }));
+}
+
+export function selectPlacement(coordinates, options = {}) {
+    if (!coordinates || !Number.isFinite(coordinates.latitude) || !Number.isFinite(coordinates.longitude) ||
+        Math.abs(coordinates.latitude) > 90 || Math.abs(coordinates.longitude) > 180) {
+        throw new Error("Placement requires valid latitude and longitude.");
+    }
+    const centroid = coordinates;
+    const cloudProviders = options.cloudProviders || loadCloudProviders(options.autoscaleConfig || options.clouds || options);
+    const dnsLocations = loadDnsLocations(options.autoscaleConfig?.dns);
+    const dns = centroid
+        ? findNearestDnsLocations(centroid.latitude, centroid.longitude, dnsLocations)
+        : [];
+    const origin = dns[0] || centroid;
+    const nearestCloudRegion = origin ? findNearestCloudRegion(origin.latitude, origin.longitude, {
+        providers: options.providers,
+        cloudProviders,
+        autoscaleConfig: options.autoscaleConfig
+    }) : null;
+    return { dns, nearestCloudRegion };
+}
+
 /**
  * Finds the nearest cloud datacenter region across active cloud providers
  * to a target latitude/longitude centroid, returning region metadata and instance catalog.
@@ -123,7 +170,7 @@ export function findNearestCloudRegion(targetLatitude, targetLongitude, options 
     }
 
     let locations = options.cloudProviders || options.cloudProvidersList;
-    if (!locations || locations.length === 0) {
+    if (!locations) {
         locations = loadCloudProviders(options.autoscaleConfig || options.clouds || options);
     }
 
@@ -208,40 +255,28 @@ export function calculateWeightedCentroid(clients) {
 }
 
 /**
- * Primary entry point: Calculates optimal cloud provider target and datacenter location.
- * Implements optional continent-based load shedding and fallback behavior.
- * Returns clean, normalized cloud target metadata.
+ * Calculates demand coordinates independently of dns and cloud catalogs.
+ * Applies optional continent-based load shedding before calculating the centroid.
  * 
  * @param {Array<Object>} clients - Active client instances or location distribution map
  * @param {Object} [options] - Configuration options passed from Autoscaler
- * @returns {Object|null} Complete recommended target metadata containing cloud provider, region, and instances catalog
+ * @returns {Object|null} Target centroid and demand distribution metadata
  */
-export function getCloudProvider(clients, options = {}) {
+export function getDensityTarget(clients, options = {}) {
     if (!clients || clients.length === 0) {
         console.log("[@cocreate/autoscaler] [GEO-SCALING] No active client location data provided.");
         return null;
     }
-
-    // Load active cloud providers directly from the passed config/options
-    const locations = options.cloudProviders || loadCloudProviders(options.autoscaleConfig || options.clouds || options);
-
-    const providers = options.providers;
 
     const totalActiveClients = clients.reduce((sum, item) => sum + (item.count || 1), 0);
 
     // 1. GLOBAL SCALING MODE (Default behavior if continent scaling is disabled)
     if (!options.geoScaleByContinent) {
         const globalCentroid = calculateWeightedCentroid(clients);
-        const nearestCloud = globalCentroid ? findNearestCloudRegion(globalCentroid.latitude, globalCentroid.longitude, {
-            providers,
-            cloudProviders: locations,
-            autoscaleConfig: options.autoscaleConfig
-        }) : null;
 
         return {
             geoScaleByContinent: false,
             targetCentroid: globalCentroid,
-            nearestCloudRegion: nearestCloud,
             totalActiveClients,
             timestamp: Date.now()
         };
@@ -291,15 +326,6 @@ export function getCloudProvider(clients, options = {}) {
 
     // Calculate centroid strictly using the clients from the targeted continent
     const regionalCentroid = calculateWeightedCentroid(targetContinentData.clients);
-    let nearestCloud = null;
-
-    if (regionalCentroid) {
-        nearestCloud = findNearestCloudRegion(regionalCentroid.latitude, regionalCentroid.longitude, {
-            providers,
-            cloudProviders: locations,
-            autoscaleConfig: options.autoscaleConfig
-        });
-    }
 
     return {
         geoScaleByContinent: true,
@@ -312,10 +338,16 @@ export function getCloudProvider(clients, options = {}) {
             percentage: parseFloat(((c.weight / totalActiveClients) * 100).toFixed(1))
         })),
         targetCentroid: regionalCentroid,
-        nearestCloudRegion: nearestCloud,
         totalActiveClients,
         timestamp: Date.now()
     };
+}
+
+/** Resolve density first, then pass only its coordinates to placement. */
+export function getCloudProvider(clients, options = {}) {
+    const density = getDensityTarget(clients, options);
+    if (!density?.targetCentroid) return null;
+    return { ...density, ...selectPlacement(density.targetCentroid, options) };
 }
 
 export default getCloudProvider;

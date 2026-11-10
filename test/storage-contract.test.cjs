@@ -3,68 +3,28 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const source = fs.readFileSync(require.resolve('../src/index.js'), 'utf8');
-const start = source.indexOf('export async function scaleOut(');
-const end = source.indexOf('\n/**', start);
-const scaleOut = source.slice(start, end).replace('export async function', 'async function');
-
-async function run(storage = 'storage-id', apikey) {
-    const requests = [];
-    const crudRequests = [];
-    const credentialReads = [];
-    const context = vm.createContext({
-        autoscaleConfig: { storage, host: 'example.com', startupScript: { $concat: [['script']] }, binaryUrl: 'https://example.com/runtime.tar.gz', endpoint: { create: 'create-instance' } },
-        getValueFromObject: (object, path) => path.split('.').reduce((value, key) => value?.[key], object),
-        config: { get(name) {
-            assert.equal(name, 'apikey', 'Unexpected configuration lookup');
-            credentialReads.push(name);
-            return apikey;
-        } },
-        clusterHost: undefined,
-        uuid: () => 'suffix',
-        determineScaleOutTarget: async () => ({ provider: 'test-cloud', providerType: 'aws', region: 'example', instanceType: 'small', apiId: 'api-id' }),
-        ObjectId: () => ({ toString: () => 'server-id' }),
-        console: { log() {}, error() {} },
-        server: {
-            host: 'example.com', organization_id: 'platform', cluster_id: 'cluster-id',
-            crud: { send: async request => {
-                crudRequests.push(request);
-                assert.equal(request.array, 'servers', 'Autoscaler must not fetch storage from apis');
-                return { object: [request.object] };
-            } },
-            api: { send: async request => {
-                requests.push(request);
-                return { data: { instanceId: 'instance-id' } };
-            } }
-        }
-    });
-    vm.runInContext(scaleOut, context);
-    await context.scaleOut([]);
-    return { requests, crudRequests, credentialReads };
+function extract(name) {
+    const start = source.indexOf(`export async function ${name}(`);
+    return source.slice(start, source.indexOf('\n/**', start)).replace('export async function', 'async function');
 }
 
-test('autoscaler passes the cluster storage ID directly to create-instance', async () => {
-    const { requests, crudRequests } = await run();
-    assert.equal(requests.length, 1);
-    assert.equal(requests[0].data.storage, 'storage-id');
-    assert.equal(requests[0].data.storageProvider, undefined);
-    assert.equal(requests[0].data.cluster_id, 'cluster-id');
-    assert.equal(crudRequests.length, 1);
-});
-
-test('autoscaler requires a storage ID instead of embedded bootstrap credentials', async () => {
-    await assert.rejects(run(''), /storage API record ID/);
-    await assert.rejects(run({ name: 'mongo', provider: 'mongodb', connectionString: 'mongodb://example' }), /storage API record ID/);
-});
-
-test('scale-out does not send node API keys to the cloud provider', async () => {
-    const { requests, crudRequests, credentialReads } = await run('storage-id', 'test-only-node-key');
-    assert.deepEqual(credentialReads, [], 'Scale-out must not read the configured node credential');
-    assert.equal(Object.hasOwn(requests[0].data, 'apikey'), false);
-    assert.equal(JSON.stringify(requests).includes('test-only-node-key'), false);
-    assert.equal(JSON.stringify(crudRequests).includes('test-only-node-key'), false);
-});
-
-test('scale-out omits the API key when none is configured', async () => {
-    const { requests } = await run();
-    assert.equal(Object.hasOwn(requests[0].data, 'apikey'), false);
+test('scale-out forwards the saved cluster storage and startup script to its workflow without fetching credentials or reserving inventory', async () => {
+    const clusterConfig = { _id: 'cluster', storage: 'storage-id', startupScript: 'already rendered', clouds: ['cloud-api'] };
+    const original = structuredClone(clusterConfig), requests = [];
+    const context = vm.createContext({ clusterConfig,
+        config: { get() { assert.fail('Dispatch does not read node credentials'); } },
+        determineScaleOutTarget: async () => ({ apiId: 'cloud-api', region: 'example', type: 'small', dns: [] }),
+        server: { organization_id: 'tenant', host: 'tenant.test',
+            crud: { send() { assert.fail('The workflow owns inventory and storage validation'); } },
+            api: { send() { assert.fail('Scale-out targets a workflow'); } },
+            workflow: { run: async payload => { requests.push(JSON.parse(JSON.stringify(payload))); return { data: { id: 'i-test' } }; } }
+        }
+    });
+    vm.runInContext(`${extract('runWorkflow')}\n${extract('scaleOut')}`, context);
+    await context.scaleOut([]);
+    assert.equal(requests[0].method, 'workflow.createOrganizationServer');
+    assert.equal(requests[0].createOrganizationServer.storage, 'storage-id');
+    assert.equal(requests[0].createOrganizationServer.startupScript, 'already rendered');
+    assert.equal(requests[0].apikey, undefined);
+    assert.deepEqual(clusterConfig, original);
 });

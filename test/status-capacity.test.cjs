@@ -15,7 +15,7 @@ async function snapshot(currentSample) {
     const records = statuses.map((status, i) => ({
         _id: `node-${i}`, cluster_id: 'cluster-1', master: { status },
         worker1: { status: 'stopped', isDraining: true, isCordoned: true },
-        infrastructure: { vCPU: i < 2 ? 2 : 1000, memoryGb: i < 2 ? 8 : 1000 }
+        deployment: { vCPU: i < 2 ? 2 : 1000, memoryGb: i < 2 ? 8 : 1000 }
     }));
     records.push({ _id: 'other-cluster', cluster_id: 'other', master: { status: 'running' } });
     const now = new Date().toISOString();
@@ -108,17 +108,18 @@ test('scale-out placement excludes non-running masters from an explicit caller s
         server: { cluster_id: 'cluster-1' }, allowedApis: [{ _id: 'aws-api', name: 'aws', provider: 'aws' }],
         autoscaleConfig: {}, isAutoscalingEnabled: () => true, getValueFromObject,
         loadCloudProviders: () => [profile],
-        getCloudProvider: async (_, options) => {
+        getDensityTarget: (_, options) => {
             existingNodes = plain(options.existingNodes);
-            return { nearestCloudRegion: { ...profile, providerType: 'aws', apiId: 'aws-api' } };
+            return { targetCentroid: { latitude: 0, longitude: 0 } };
         },
+        determineDeployment: async () => ({}),
         console: { log() {} }
     });
     vm.runInContext(extract('determineScaleOutTarget'), context);
     await context.determineScaleOutTarget([], [
-        { master: { status: 'running' }, location: { continent: 'NA' } },
-        { master: { status: 'terminating' }, location: { continent: 'EU' } },
-        { master: { status: 'stopped' }, location: { continent: 'AS' } }
+        { master: { status: 'running' }, deployment: { location: { continent: 'NA' } } },
+        { master: { status: 'terminating' }, deployment: { location: { continent: 'EU' } } },
+        { master: { status: 'stopped' }, deployment: { location: { continent: 'AS' } } }
     ]);
     assert.deepEqual(existingNodes, [{ continent: 'NA' }]);
 });

@@ -8,28 +8,28 @@ function extract(name) {
     const start = source.indexOf(`export async function ${name}(`);
     return source.slice(start, source.indexOf('\n/**', start)).replace('export async function', 'async function');
 }
-async function setup(t, { managed = true, reject = false, networkFailures = 0, networkCode = 'ECONNRESET', networkName = 'Error', response = { data: { instanceId: 'vm-2' } } } = {}) {
+async function setup(t, { managed = true, reject = false, networkFailures = 0, networkCode = 'ECONNRESET', networkName = 'Error', response = { data: { id: 'vm-2' } } } = {}) {
     const { init: initManager } = await import('../../cluster/src/manager.js');
     const { default: config } = await import('@cocreate/config');
-    t.mock.method(config, 'get', () => undefined);
+    t.mock.method(config, 'get', () => managed ? { organization_id: 'parent', host: 'parent.test', apiKey: 'test-only-management-key' } : undefined);
     t.mock.method(config, 'query', async () => undefined);
     const calls = [], order = [], inventoryWrites = [];
-    const candidate = { _id: 'server-1', cluster_id: 'cluster-1', cloud: 'cloud-id', infrastructure: { instanceId: 'vm-1', region: 'region-1' } };
+    const candidate = { _id: 'server-1', cluster_id: 'cluster-1', deployment: { cloud: 'cloud-id', dns: [], id: 'vm-1', region: 'region-1' } };
     const server = {
         isPrimary: true, id: 'server-1', organization_id: 'tenant', host: 'tenant.test', cluster_id: 'cluster-1',
         crud: { send: async request => { order.push(request.method); inventoryWrites.push(plain(request.object)); return { object: [request.object] }; } },
         state: { shutdown: payload => { order.push('shutdown'); calls.push({ shutdown: plain(payload) }); } },
-        api: { send: async request => {
+        fetch: (await import('../../cluster/src/fetch.js')).default,
+        workflow: { run: async request => {
             order.push('send'); calls.push(plain(request));
             if (reject) throw new Error('transport failed');
             if (networkFailures-- > 0) throw Object.assign(new Error('connection reset'), { code: networkCode, name: networkName });
             const result = response;
-            assert.equal(managed, false, 'Managed dispatch must bypass server.api.send');
+            assert.equal(managed, false, 'Managed dispatch must bypass server.workflow.run');
             return result;
         } }
     };
     server.manager = await initManager(server);
-    if (managed) Object.assign(server.manager, { organization_id: 'parent', host: 'parent.test', apiKey: 'test-only-management-key' });
     t.mock.method(globalThis, 'fetch', async (url, options) => {
         order.push('send'); calls.push({ url, options: { method: options.method, headers: options.headers }, request: JSON.parse(options.body) });
         if (reject) throw new Error('transport failed');
@@ -37,7 +37,7 @@ async function setup(t, { managed = true, reject = false, networkFailures = 0, n
         return new Response(JSON.stringify(response), { headers: { 'content-type': 'application/json' } });
     });
     const context = vm.createContext({
-        server, clusterHost: undefined, organizationIdle: true,
+        server, clusterConfig: { _id: 'cluster-1', clouds: ['cloud-id'], startupScript: 'prepared-script' }, organizationIdle: true,
         isAutoscalingEnabled: () => true,
         autoscaleConfig: {
             name: 'cluster', storage: 'storage-id', startupScript: 'prepared-script', binaryUrl: 'https://example.test/runtime',
@@ -47,7 +47,7 @@ async function setup(t, { managed = true, reject = false, networkFailures = 0, n
         },
         getValueFromObject: (object, path) => path.split('.').reduce((value, key) => value?.[key], object),
         uuid: () => 'suffix', ObjectId: () => ({ toString: () => 'server-2' }),
-        determineScaleOutTarget: async () => ({ provider: 'parent-cloud', providerType: 'aws', region: 'region-1', instanceType: 'small', apiId: 'cloud-id' }),
+        determineScaleOutTarget: async () => ({ provider: 'parent-cloud', providerType: 'aws', region: 'region-1', type: 'small', dns: [], apiId: 'cloud-id' }),
         determineScaleInTarget: async () => ({ candidateServer: candidate }),
         allowedApis: [{ _id: 'cloud-id', name: 'parent-cloud', provider: 'aws' }],
         getClusterDetails: async () => ({ totalCount: 1, servers: [candidate], removingServers: [] }),
@@ -56,45 +56,41 @@ async function setup(t, { managed = true, reject = false, networkFailures = 0, n
         sendDrain: async (id, value) => order.push(`drain:${value}`),
         setTimeout: callback => callback(), console: { log() {}, error() {} }
     });
-    vm.runInContext(`${extract('scaleOut')}\n${extract('scaleIn')}`, context);
+    vm.runInContext(`${extract('runWorkflow')}\n${extract('scaleOut')}\n${extract('scaleIn')}`, context);
     return { context, server, calls, order, inventoryWrites };
 }
 for (const action of ['scaleOut', 'scaleIn']) {
     test(`managed ${action} sends the prepared envelope directly over HTTPS`, async t => {
         const { context, server, calls, order, inventoryWrites } = await setup(t);
         const result = await context[action](action === 'scaleOut' ? [] : undefined);
-        assert.deepEqual(plain(result), { data: { instanceId: 'vm-2' } });
+        assert.deepEqual(plain(result), { data: { id: 'vm-2' } });
         assert.equal(calls.length, action === 'scaleIn' ? 2 : 1);
         const outer = calls[0], inner = outer.request;
-        assert.equal(outer.url, 'https://parent.test/manager');
+        assert.equal(outer.url, 'https://parent.test');
         assert.equal(outer.options.headers.Authorization, 'Bearer test-only-management-key');
-        assert.equal(inner.request, undefined);
-        assert.equal(inner.api, 'parent-cloud');
-        assert.equal(inner.endpoint, action === 'scaleOut' ? 'create-instance' : 'delete-instance');
-        assert.equal(inner.method, 'post');
-        for (const key of ['organization_id', 'host', 'apikey', 'socket']) assert.equal(inner[key], undefined);
+        const name = action === 'scaleOut' ? 'createOrganizationServer' : 'deleteOrganizationServer';
+        assert.equal(inner.method, `workflow.${name}`);
+        assert.equal(inner.organization_id, 'parent');
+        assert.equal(inner.managedOrganization, 'tenant');
+        assert.equal(inner[name]._id, 'cluster-1');
         if (action === 'scaleIn') {
-            assert.equal(inner.data.server_id, 'server-1');
-            assert.equal(inner.data.cluster_id, 'cluster-1');
-            assert.equal(inner.data.vmId, 'vm-1');
+            assert.equal(inner[name].deployment.server_id, 'server-1');
+            assert.equal(inner[name].deployment.id, 'vm-1');
             assert.ok(order.indexOf('drain:true') < order.indexOf('send'));
             assert.equal(order.filter(item => item === 'capacity').length, 2);
             assert.ok(order.indexOf('terminating') < order.indexOf('send'));
             assert.deepEqual(order.slice(-2), ['send', 'shutdown']);
             assert.equal(order.includes('object.delete'), false);
         } else {
-            assert.deepEqual(inventoryWrites[0].manager, { ...server.manager });
-            assert.equal(inner.data.cluster_id, 'cluster-1');
-            assert.equal(inner.data.server_id, 'server-2');
-            assert.ok(order.indexOf('object.create') < order.indexOf('send'));
+            assert.deepEqual(inventoryWrites, []);
+            assert.equal(inner[name].deployment.type, 'small');
         }
     });
-    test(`unmanaged ${action} retains direct provider dispatch`, async t => {
+    test(`unmanaged ${action} uses local workflow dispatch`, async t => {
         const { context, calls, order } = await setup(t, { managed: false });
         await context[action](action === 'scaleOut' ? [] : undefined);
-        assert.equal(calls[0].api, 'parent-cloud');
+        assert.equal(calls[0].method, action === 'scaleOut' ? 'workflow.createOrganizationServer' : 'workflow.deleteOrganizationServer');
         assert.equal(calls[0].organization_id, 'tenant');
-        assert.equal(calls[0].data.request, undefined);
         if (action === 'scaleIn') {
             assert.ok(order.indexOf('terminating') < order.indexOf('send'));
             assert.deepEqual(order.slice(-2), ['send', 'shutdown']);
@@ -108,26 +104,17 @@ test('failed managed scale-in records failure before shutting down the target', 
     assert.equal(order.includes('drain:false'), false);
     assert.deepEqual(order.slice(-2), ['failed', 'shutdown']);
 });
-test('failed managed scale-out retains the failed-inventory update', async t => {
+test('failed managed scale-out leaves inventory ownership in the workflow', async t => {
     const { context, order } = await setup(t, { reject: true });
     await assert.rejects(context.scaleOut([]), /transport failed/);
-    assert.equal(order.at(-1), 'object.update');
+    assert.equal(order.includes('object.update'), false);
 });
-test('managed dispatch rejects malformed or failed responses', async t => {
-    const { init: initManager } = await import('../../cluster/src/manager.js');
-    const { default: config } = await import('@cocreate/config');
-    t.mock.method(config, 'get', () => undefined);
-    t.mock.method(config, 'query', async () => undefined);
-    let result;
-    t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify(result), { headers: { 'content-type': 'application/json' } }));
+test('scale-out rejects malformed or failed workflow responses', async t => {
     for (const response of [null, { success: false, data: {} }, { error: ['failed'], data: {} }]) {
-        result = response;
-        const manager = await initManager({ isPrimary: true });
-        Object.assign(manager, { organization_id: 'parent', host: 'parent.test', apiKey: 'test' });
-        await assert.rejects(manager.send({ method: 'post' }), /manager/i);
+        const { context } = await setup(t, { response });
+        await assert.rejects(context.scaleOut([]), /manager|provisioning/i);
     }
 });
-
 
 test('AutoScaler writes removal status to master.status without replacing the master object', async () => {
     const writes = [];

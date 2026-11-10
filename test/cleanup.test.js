@@ -57,8 +57,31 @@ test('managed local deletion also asks Manager to delete its copy; duplicate del
     assert.equal(calls.length, 2);
     assert.ok(calls.every(call => call.method === 'object.delete'));
     assert.deepEqual(mirrors, Array(2).fill({
-        method: 'object.delete', array: 'servers', object: { _id: 'terminating' }
+        method: 'object.delete', array: 'servers', object: [{ _id: 'terminating' }],
+        organization_id: 'tenant', host: 'tenant.test'
     }));
+});
+
+test('local CRUD scope resolution does not leak into the forwarded deletion envelope', async () => {
+    const { server } = setup(true);
+    server.crud.send = async payload => {
+        payload.database = 'tenant-database';
+        payload.storageConfig = { connectionString: 'tenant-only' };
+        payload.storage = 'tenant-storage';
+        payload.object = [];
+        return { object: [] };
+    };
+    let forwarded;
+    server.manager.send = async payload => {
+        forwarded = structuredClone(payload);
+        payload.organization_id = 'platform';
+        return { object: [] };
+    };
+    await deleteServer(server, 'server-id');
+    assert.deepEqual(forwarded, {
+        method: 'object.delete', array: 'servers', object: [{ _id: 'server-id' }],
+        organization_id: 'tenant', host: 'tenant.test'
+    });
 });
 
 test('parent cleanup deletes tenant before platform, with no status read or mirror loop', async () => {

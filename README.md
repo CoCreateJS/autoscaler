@@ -70,7 +70,7 @@ The autoscaler connects directly to the local `@cocreate/telemetry` Data Engine 
 $$\text{Saturation Index} = \alpha \cdot \text{V8 CPU Lag} + \beta \cdot \text{RAM Utilization} + \gamma \cdot \text{Socket Density}$$
 
 * **Self-Healing Interventions:** If the Saturation Index exceeds your configured safety threshold for a sustained period, the autoscaler initiates scaling protocols.
-* **Dead-Node Pruning:** When a peer server drops offline without a clean exit (e.g., hardware failure or kernel panic), the active nodes wait for a stagger delay before pruning the dead node's records from the database registry and redistributing tenant routing channels.
+* **Dead-Node Pruning:** When a peer server drops offline without a clean exit (e.g., hardware failure or kernel panic), the active nodes wait for a stagger delay before pruning the dead node's records from the database registry and redistributing tenant dns channels.
 
 ---
 
@@ -131,6 +131,27 @@ Configure the autoscaler with the following policy structure. Cloud-provider con
 ### Vertical resource bounds
 
 `vertical.min` defines the first server size and `vertical.max` defines the upper resource boundary. The autoscaler can add up to `maxNodesPerTier` regional servers at the current size. Once that count is reached, the next target doubles the current vCPU and memory values, capped independently by their configured maximums. The cloud adapter then selects the smallest available provider instance that satisfies both target values.
+
+`getDensityTarget` calculates the demand centroid using the existing global or
+continent-based policy. When enabled, scoped `servers_config` records of type
+`dns` provide eligible locations. The autoscaler chooses one nearest POP per DNS connection,
+sorts the selections by their exact distance from the demand centroid, and uses the first
+POP to select the nearest allowed cloud region.
+Without eligible DNS locations, it selects the cloud region directly from
+the demand centroid. Instance sizing follows the selected cloud region as before.
+
+DNS catalogs are merged into `dns`, keyed by provider, with arrays of
+normalized locations containing `id`, `latitude`, `longitude`, and optional
+`name`, `countryCode`, and `continent` fields. Locations marked `enabled: false`
+or `allowLatencyRouting: false`, or missing finite coordinates, are excluded.
+Cloud catalogs are loaded separately from records of type `clouds`; both catalog
+queries use the same organization and runtime scope as the autoscaler settings.
+The scale-out decision includes the sorted `dns` array. Each POP retains its provider,
+location ID, connection `apiId`, coordinates and metadata. Each `distanceKm` measures demand-to-POP distance;
+the decision's top-level `distanceKm` measures first-POP-to-cloud distance, or
+demand-to-cloud distance when dns is empty. No eligible POPs produces `dns: []`.
+The complete array travels in `deployment.dns` and is stored as `server.deployment.dns`.
+
 
 ### Decommission strategy
 
@@ -227,3 +248,49 @@ capacity remains; other capacity-change checks still apply. Evaluation already i
 can defer the retained idle request until a subsequent telemetry evaluation. No client
 counts or peer registrations are validated again by AutoScaler. Drain, provider termination,
 shutdown and inventory cleanup follow the existing lifecycle.
+
+
+### Workflow provisioning
+
+Scale-out keeps the saved cluster separate from merged autoscaler catalogs. After placement
+and VM sizing, it sends `workflow.createOrganizationServer` with
+`createOrganizationServer: { ...cluster, deployment }`. The deployment contains the selected
+cloud API ID, region, type and sorted dns POP array. Local dispatch uses `server.workflow.run`;
+managed nodes use the same envelope through `server.manager.send`. The common platform
+workflow owns validation and inventory; provider workflows own cloud operations. Scale-out
+requires a saved cluster and its rendered startup script. Scale-in sends `workflow.deleteOrganizationServer` through that same dispatch helper.
+
+
+`scaleOut(cluster, [], coordinates)` generates a deployment for the supplied cluster.
+The platform primary listens for `organizationPeers`, loads the non-local organization's
+cluster and saved `location: { latitude, longitude }` on an empty result, and calls this
+coordinate-based path. Policies and enabled cloud APIs are resolved for that target
+cluster without replacing the platform's cached configuration. Missing or invalid
+coordinates stop activation. Saved clusters no longer need a static deployment. The listener is installed before
+Mesh initialization. Telemetry continues to call `scaleOut(clientLocations, activeServers)`.
+`runWorkflow(name, cluster)` constructs a fresh standard envelope per operation, choosing
+`server.manager.send` or `server.workflow.run`. It does not store a shared mutable payload.
+Deletion passes the selected server reference; the parent workflow reloads canonical
+inventory and delegates to `delete<CloudName>Instance`. DNS registration/removal is
+still pending integration; delayed inventory cleanup remains separate.
+
+AutoScaler fetches `autoscaler`, `clouds`, and `dns` configuration types. It does
+not fetch a standalone startup-script configuration. `createClusterConfig` renders
+`cluster.startupScript` at creation; AutoScaler forwards that saved cluster unchanged
+except for the current deployment. Provider workflows consume the saved script.
+
+### Optional provider selections
+
+`cluster.clouds` and `cluster.dns` are optional API-ID whitelists. Missing values,
+empty strings and empty arrays allow all enabled API connections of the corresponding
+type in the executing organization. Nonempty selections restrict API records by ID;
+a single ID string is also accepted. Matching `clouds` and `dns` server configs
+supply catalogs, which are filtered through those connections. Multiple connections
+for one DNS provider keep separate POP entries identified by `apiId`.
+
+An explicit cloud selection with no usable connection fails placement. An explicit
+DNS selection with no eligible POPs also fails; it never silently expands to other
+providers. With no DNS restriction and no eligible DNS connections/POPs,
+placement goes directly to a cloud region. API-read failures stop resolution.
+First-node activation resolves connections in platform scope, while ordinary tenant
+scaling resolves them in the tenant scope. Credentials are not added to DNS POPs.

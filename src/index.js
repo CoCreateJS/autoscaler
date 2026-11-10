@@ -20,8 +20,8 @@ import cluster from 'node:cluster';
 import { deleteServer, collectTerminatingServers, startServerCleanup } from './cleanup.js';
 export { deleteServer } from './cleanup.js';
 import config from '@cocreate/config';
-import { ObjectId, getValueFromObject, dotNotationToObject, uuid } from '@cocreate/utils';
-import { getCloudProvider, loadCloudProviders } from './geoScaling.js';
+import { getValueFromObject, dotNotationToObject } from '@cocreate/utils';
+import { getDensityTarget, selectPlacement, loadCloudProviders, loadDnsLocations } from './geoScaling.js';
 
 // Guard clause verification to ensure cluster API abstraction integrity
 const isPrimary = cluster.isPrimary;
@@ -29,8 +29,8 @@ const isPrimary = cluster.isPrimary;
 let server = null;
 
 let autoscaleConfig = {};
+let clusterConfig = null;
 let allowedApis = [];
-let clusterHost;
 const workerStreaks = new Map();
 let evaluating = false;
 let organizationIdle = false;
@@ -55,9 +55,7 @@ function isAutoscalingEnabled() {
  * @environment server
  */
 export async function loadAutoscaleConfig() {
-    const resolved = {};
-    let clusterCloudIds;
-    clusterHost = undefined;
+    clusterConfig = null;
     if (server.id) {
         const response = await server.crud.send({
             method: 'object.read',
@@ -76,47 +74,78 @@ export async function loadAutoscaleConfig() {
             host: server.host,
             filter: { query: { _id: server.cluster_id }, limit: 1 }
         });
-        const clusterConfig = response?.object?.[0];
-        if (clusterConfig) {
-            // Keep the cluster's cloud API IDs separate from `clouds.<name>`
-            // autoscaler settings merged below.
-            clusterCloudIds = clusterConfig.clouds ?? clusterConfig.providers;
-            clusterHost = clusterConfig.host;
-            dotNotationToObject(clusterConfig, resolved);
+        const clusterRecord = response?.object?.[0];
+        if (clusterRecord) {
+            clusterConfig = structuredClone(clusterRecord);
         }
     }
 
+    const resolved = await resolveClusterConfig(clusterConfig);
+    autoscaleConfig = resolved.autoscaleConfig;
+    allowedApis = resolved.allowedApis;
+    return autoscaleConfig;
+}
+
+/** Resolve one cluster's policies and catalogs without changing another cluster's runtime. */
+export async function resolveClusterConfig(targetCluster) {
+    const resolved = {};
+    if (targetCluster) dotNotationToObject(structuredClone(targetCluster), resolved);
+    const clusterCloudIds = targetCluster?.clouds ?? targetCluster?.providers;
+    const clusterDnsIds = targetCluster?.dns;
     const sysConfig = await config.get('autoscaler');
 
-    const dbConfig = await config.query({
-        type: ['startupscript', 'autoscaler'],
+    const scope = {
         organization_id: server.organization_id,
         server: server.host,
-        cluster: server.cluster_id
-    }, server.crud);
+        cluster: targetCluster?._id
+    };
+    // Catalogs have provider keys at their root; keep DNS and clouds separate.
+    const [dbConfig, clouds, dns] = await Promise.all([
+        config.query({ ...scope, type: 'autoscaler' }, server.crud),
+        config.query({ ...scope, type: 'clouds' }, server.crud),
+        config.query({ ...scope, type: 'dns' }, server.crud)
+    ]);
+    if (clouds && Object.keys(clouds).length) resolved.clouds = clouds;
+    if (dns && Object.keys(dns).length) resolved.dns = dns;
 
     // The cluster is the baseline; matching configs overwrite it in query order.
     if (sysConfig) dotNotationToObject(sysConfig, resolved);
     if (dbConfig) dotNotationToObject(dbConfig, resolved);
 
-    // `clouds` is the current cluster field. Fall back to `providers` for
-    // existing cluster records until they are migrated. The IDs are captured
-    // before merging `clouds.<name>` autoscaler settings into `resolved`.
-    const providerIds = clusterCloudIds;
-    allowedApis = [];
-    if (Array.isArray(providerIds) && providerIds.length) {
-        const responses = await Promise.all(providerIds.map(id => server.crud.send({
-            method: 'object.read',
-            array: 'apis',
-            organization_id: server.organization_id,
-            host: server.host,
-            filter: { query: { _id: id, type: 'cloud', enabled: true }, limit: 1 }
-        })));
-        allowedApis = responses.map(response => response?.object?.[0]).filter(Boolean);
+    const readApis = async (type, selection) => {
+        const ids = selection == null || selection === '' ? [] :
+            typeof selection === 'string' ? [selection] : selection;
+        if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string' || !id.trim())) {
+            throw new Error(`Cluster ${type} selection must contain API IDs.`);
+        }
+        const response = await server.crud.send({
+            method: 'object.read', array: 'apis',
+            organization_id: server.organization_id, host: server.host,
+            filter: { query: { type, enabled: true, ...(ids.length && { _id: { $in: ids } }) }, limit: 0 }
+        });
+        if (!response || response.success === false ||
+            (Array.isArray(response.error) ? response.error.length : response.error) || !Array.isArray(response.object)) {
+            throw new Error(`Unable to read cluster ${type} APIs.`);
+        }
+        return response.object;
+    };
+    const [clusterApis, dnsApis] = await Promise.all([
+        readApis('cloud', clusterCloudIds), readApis('dns', clusterDnsIds)
+    ]);
+    const dnsCatalog = resolved.dns;
+    // Catalogs describe provider POPs; API records determine which connections may use them.
+    resolved.dns = {};
+    for (const api of dnsApis) {
+        const provider = api.provider || api.name;
+        const locations = dnsCatalog?.[provider];
+        if (!Array.isArray(locations)) continue;
+        resolved.dns[provider] ||= [];
+        resolved.dns[provider].push(...locations.map(location => ({ ...location, apiId: api._id })));
     }
-
-    autoscaleConfig = resolved;
-    return resolved;
+    if (clusterDnsIds?.length && !loadDnsLocations(resolved.dns).length) {
+        throw new Error('No eligible DNS locations match the cluster DNS APIs.');
+    }
+    return { autoscaleConfig: resolved, allowedApis: clusterApis };
 }
 
 /**
@@ -225,7 +254,7 @@ async function getClusterDetails(query = {}, currentSample) {
  * @private
  * @environment server
  */
-function determineTargetTier(targetRegion, activeClusterServers) {
+function determineTargetTier(targetRegion, activeClusterServers, autoscaleConfig) {
     const minimum = getValueFromObject(autoscaleConfig, 'vertical.min') || {};
     const maximum = getValueFromObject(autoscaleConfig, 'vertical.max') || {};
     const maxNodesPerTier = Number(getValueFromObject(autoscaleConfig, 'vertical.maxNodesPerTier'));
@@ -247,8 +276,8 @@ function determineTargetTier(targetRegion, activeClusterServers) {
 
     const regionalServers = activeClusterServers.filter((serverNode) =>
         serverNode.region === targetRegion ||
-        serverNode.infrastructure?.region === targetRegion ||
-        serverNode.location?.region === targetRegion
+        serverNode.deployment?.region === targetRegion ||
+        serverNode.deployment?.location?.region === targetRegion
     );
 
     if (regionalServers.length === 0) {
@@ -256,28 +285,28 @@ function determineTargetTier(targetRegion, activeClusterServers) {
     }
 
     const nodeTiers = regionalServers.map((serverNode) => {
-        const infrastructure = serverNode.infrastructure || {};
-        const provider = serverNode.provider || infrastructure.provider;
-        const instanceType = serverNode.instanceType || serverNode.vmType || infrastructure.vmType;
+        const deployment = serverNode.deployment || {};
+        const provider = serverNode.provider || deployment.provider;
+        const type = serverNode.type || deployment.type;
         const providerInstances = getValueFromObject(
             autoscaleConfig,
             `clouds.${provider}.instances`
         ) || [];
-        const instance = providerInstances.find(({ name }) => name === instanceType);
+        const instance = providerInstances.find(({ name }) => name === type);
 
         return {
             vCPU: Math.min(
                 maxTier.vCPU,
                 Math.max(
                     minTier.vCPU,
-                    Number(serverNode.vCPU || infrastructure.vCPU || instance?.vCPU) || minTier.vCPU
+                    Number(serverNode.vCPU || deployment.vCPU || instance?.vCPU) || minTier.vCPU
                 )
             ),
             memoryGb: Math.min(
                 maxTier.memoryGb,
                 Math.max(
                     minTier.memoryGb,
-                    Number(serverNode.memoryGb || infrastructure.memoryGb || instance?.memoryGb) || minTier.memoryGb
+                    Number(serverNode.memoryGb || deployment.memoryGb || instance?.memoryGb) || minTier.memoryGb
                 )
             )
         };
@@ -341,7 +370,7 @@ function selectInstanceType(instances = [], targetTier) {
 }
 
 /**
- * Calculates scale-out targeting details: provider, region, instanceType, vCPU, memoryGb,
+ * Calculates scale-out targeting details: provider, region, type, vCPU, memoryGb,
  * datacenterName, countryCode, and geo latency metadata based on client traffic distribution.
  *
  * @param {Array<Object>} clientLocations - Active client traffic distribution points
@@ -351,37 +380,37 @@ function selectInstanceType(instances = [], targetTier) {
  * @environment server
  */
 export async function determineScaleOutTarget(clientLocations, activeServers) {
-    if (!isAutoscalingEnabled()) throw new Error('Autoscaling is disabled.');
-    if (!server.cluster_id) throw new Error('Autoscaling requires a cluster ID.');
-    if (!allowedApis.length) throw new Error('Autoscaling requires enabled cloud APIs in cluster clouds.');
-
+    if (!isAutoscalingEnabled()) throw new Error("Autoscaling is disabled.");
+    if (!server.cluster_id) throw new Error("Autoscaling requires a cluster ID.");
+    const currentServers = (activeServers ?? (await getClusterDetails()).servers)
+        .filter(item => item.master.status === 'running');
     const isGeoEnabled = getValueFromObject(autoscaleConfig, 'geoScale.enabled');
     const sheddingThreshold = getValueFromObject(autoscaleConfig, 'geoScale.sheddingThreshold');
     if (isGeoEnabled === true && !Number.isFinite(Number(sheddingThreshold))) {
         throw new Error('Geographic scaling requires a configured shedding threshold.');
     }
-    const regions = loadCloudProviders(autoscaleConfig);
-    const cloudProviders = allowedApis.flatMap(api =>
+    const density = getDensityTarget(clientLocations, {
+        geoScaleByContinent: isGeoEnabled, sheddingThreshold,
+        existingNodes: currentServers.map(item => ({
+            continent: item.deployment?.location?.continent || item.deployment?.continent
+        }))
+    });
+    const target = await determineDeployment(density?.targetCentroid, currentServers);
+    return { ...density, ...target };
+}
+
+/** Generate a deployment from coordinates using the target cluster's resolved configuration. */
+export async function determineDeployment(coordinates, activeServers = [], configuration = { autoscaleConfig, allowedApis }) {
+    const { autoscaleConfig: placementConfig, allowedApis: clusterApis } = configuration;
+    if (!clusterApis.length) throw new Error('Autoscaling requires enabled cloud APIs in cluster clouds.');
+    const regions = loadCloudProviders(placementConfig);
+    const cloudProviders = clusterApis.flatMap(api =>
         regions.filter(region => region.provider === api.provider).map(region => ({
-            ...region,
-            provider: api.name,
-            providerType: api.provider,
-            apiId: api._id
+            ...region, provider: api.name, providerType: api.provider, apiId: api._id
         }))
     );
-
-    const currentServers = (activeServers ?? (await getClusterDetails()).servers)
-        .filter(item => item.master.status === 'running');
-    const geoTarget = await getCloudProvider(clientLocations, {
-        geoScaleByContinent: isGeoEnabled,
-        sheddingThreshold,
-        cloudProviders,
-        existingNodes: currentServers.map(item => ({
-            continent: item.location?.continent || item.infrastructure?.continent
-        })),
-        autoscaleConfig
-    });
-
+    const currentServers = activeServers.filter(item => item.master.status === 'running');
+    const geoTarget = selectPlacement(coordinates, { cloudProviders, autoscaleConfig: placementConfig });
     const cloudRegion = geoTarget?.nearestCloudRegion;
     if (!cloudRegion) throw new Error('No configured region matches the enabled cluster providers.');
     const provider = cloudRegion.provider;
@@ -394,15 +423,15 @@ export async function determineScaleOutTarget(clientLocations, activeServers) {
         .every(value => Number.isFinite(Number(value)) && Number(value) > 0))) {
         throw new Error(`The default instance for ${providerType} needs vCPU and memoryGb.`);
     }
-    const targetTier = getValueFromObject(autoscaleConfig, 'vertical.enabled') === true
-        ? determineTargetTier(region, currentServers)
+    const targetTier = getValueFromObject(placementConfig, 'vertical.enabled') === true
+        ? determineTargetTier(region, currentServers, placementConfig)
         : defaultInstance && {
             vCPU: Number(defaultInstance.vCPU),
             memoryGb: Number(defaultInstance.memoryGb),
             tierIndex: 0
         };
     if (!targetTier) throw new Error(`No default instance is configured for ${providerType}.`);
-    const instanceType = getValueFromObject(autoscaleConfig, 'vertical.enabled') === true
+    const type = getValueFromObject(placementConfig, 'vertical.enabled') === true
         ? selectInstanceType(providerInstances, targetTier)
         : defaultInstance.name;
 
@@ -411,7 +440,7 @@ export async function determineScaleOutTarget(clientLocations, activeServers) {
         providerType,
         apiId: cloudRegion.apiId,
         region,
-        instanceType,
+        type,
         vCPU: targetTier.vCPU,
         memoryGb: targetTier.memoryGb,
         targetTier,
@@ -419,11 +448,7 @@ export async function determineScaleOutTarget(clientLocations, activeServers) {
         countryCode: cloudRegion.countryCode,
         coordinates: cloudRegion.coordinates,
         distanceKm: cloudRegion.distanceKm,
-        geoScaleByContinent: geoTarget.geoScaleByContinent,
-        targetContinent: geoTarget.targetContinent,
-        isSheddingTarget: geoTarget.isSheddingTarget,
-        targetPercentage: geoTarget.targetPercentage,
-        totalActiveClients: geoTarget.totalActiveClients,
+        dns: geoTarget.dns,
         timestamp: Date.now()
     };
 
@@ -433,129 +458,48 @@ export async function determineScaleOutTarget(clientLocations, activeServers) {
 
 /**
  * Triggers horizontal scale-out provisioning workflow:
- * 1. Computes optimal cloud provider, region, instance type, vCPU, memory, datacenter, and country code via determineScaleOutTarget.
- * 2. Fetches static configurations (spot, startupScript, os, application, create endpoint) directly from autoscaleConfig.
- * 3. Dispatches instance creation API call via server.api.send.
+ * Chooses the current deployment, then sends the saved cluster to the common
+ * provisioning workflow locally or through the upstream manager transport.
  *
- * @param {Array<Object>} clientLocations - Active client traffic location points
+ * @param {Array<Object>|Object} input - Client locations to calculate density, or the target cluster
  * @param {Array<Object>} [activeServers] - Cluster snapshot, fetched when omitted
+ * @param {Object} [coordinates] - Organization location when input is a target cluster
  * @returns {Promise<Object>} API execution result payload
  * @public
  * @environment server
  */
-export async function scaleOut(clientLocations, activeServers) {
-    const target = await determineScaleOutTarget(clientLocations, activeServers);
-    const provider = target.provider;
-    const providerType = target.providerType;
-
-    // Retrieve static provisioning configurations directly from autoscaleConfig
-    const spot = getValueFromObject(autoscaleConfig, 'spot');
-    const startupScript = getValueFromObject(autoscaleConfig, `clouds.${providerType}.startupScript`) || getValueFromObject(autoscaleConfig, 'startupScript');
-    const os = getValueFromObject(autoscaleConfig, `clouds.${providerType}.os`) || getValueFromObject(autoscaleConfig, 'os');
-    const application = getValueFromObject(autoscaleConfig, `clouds.${providerType}.application`) || getValueFromObject(autoscaleConfig, 'application');
-    const endpoint = getValueFromObject(autoscaleConfig, `clouds.${providerType}.endpoint.create`) ||
-        getValueFromObject(autoscaleConfig, 'endpoint.create');
-    const method = getValueFromObject(autoscaleConfig, `clouds.${providerType}.method.create`);
-    if (!endpoint) throw new Error(`No create endpoint is configured for ${providerType}.`);
-    if (!startupScript) throw new Error('Scale-out requires a startup script.');
-    const binaryUrl = getValueFromObject(autoscaleConfig, 'binaryUrl');
-    const deploymentHost = clusterHost || getValueFromObject(autoscaleConfig, 'host') || server.host;
-    if (!binaryUrl || !deploymentHost) {
-        throw new Error('Scale-out requires a binary URL and deployment host.');
-    }
-
-    const storageId = getValueFromObject(autoscaleConfig, 'storage');
-    if (typeof storageId !== 'string' || !storageId.trim()) {
-        throw new Error('Scale-out requires the cluster storage API record ID.');
-    }
-
-    const serverId = ObjectId().toString();
-    const clusterName = getValueFromObject(autoscaleConfig, 'name');
-    const serverName = `${clusterName}-${target.provider}-${target.region}-${uuid(6)}`;
-    const newServer = {
-        _id: serverId,
-        name: serverName,
-        cluster_id: server.cluster_id,
-        cloud: target.apiId,
-        storage: storageId,
-        host: deploymentHost,
-        totalWorkers: 0,
-        master: { status: 'provisioning' },
-        infrastructure: {
-            provider: providerType,
-            region: target.region,
-            vmType: target.instanceType,
-            vCPU: target.vCPU,
-            memoryGb: target.memoryGb
-        }
+export async function scaleOut(input, activeServers, coordinates) {
+    const targetCluster = Array.isArray(input) ? clusterConfig : input;
+    if (!targetCluster?._id) throw new Error('Scale-out requires the saved cluster configuration.');
+    const target = Array.isArray(input)
+        ? await determineScaleOutTarget(input, activeServers)
+        : await determineDeployment(coordinates, activeServers || [], await resolveClusterConfig(targetCluster));
+    const deployment = {
+        cloud: target.apiId, region: target.region, type: target.type,
+        vCPU: target.vCPU, memoryGb: target.memoryGb, dns: target.dns,
+        location: target.coordinates
     };
-    const created = await server.crud.send({
-        method: 'object.create',
-        array: 'servers',
-        object: newServer,
-        organization_id: server.organization_id,
-        host: server.host
-    });
-    if (created?.error?.length || !created?.object?.length) {
-        throw new Error('Unable to reserve a server record for scale-out.');
+    const response = await runWorkflow('createOrganizationServer', { ...targetCluster, deployment });
+    if (!response || response.success === false ||
+        (Array.isArray(response.error) ? response.error.length : response.error)) {
+        throw new Error('Server provisioning workflow failed.');
     }
+    return response;
+}
 
-    console.log(`[@cocreate/autoscaler] [SCALE-OUT] Sending instance creation API request for provider [${provider}] on endpoint [${endpoint}] in region [${target.region}]...`);
-
-    const apiPayload = {
-        api: provider,
-        ...(method && { method }),
-        endpoint,
+/** Send each operation's cluster through the same standard workflow envelope. */
+export async function runWorkflow(name, targetCluster) {
+    if (!targetCluster?._id) throw new Error('Server workflows require the saved cluster configuration.');
+    const payload = {
+        method: `workflow.${name}`,
         organization_id: server.organization_id,
         host: server.host,
-        region: target.region,
-        data: {
-            provider: providerType,
-            cloud: target.apiId,
-            region: target.region,
-            vmType: target.instanceType,
-            vCPU: target.vCPU,
-            memoryGb: target.memoryGb,
-            datacenterName: target.datacenterName,
-            countryCode: target.countryCode,
-            cluster_id: server.cluster_id,
-            name: serverName,
-            server_id: serverId,
-            host: deploymentHost,
-            binaryUrl,
-            environment: `server_id=${serverId}\ncluster_id=${server.cluster_id}`,
-            storage: storageId,
-            spot,
-            startupScript,
-            os,
-            application
-        }
+        managedOrganization: targetCluster.managedOrganization || server.organization_id,
+        [name]: { ...targetCluster }
     };
-
-    try {
-        const response = await (server.manager?.organization_id ? server.manager.send(apiPayload) : server.api.send(apiPayload));
-        // TODO: Preserve manager.send network errors for bounded retries at this boundary.
-        // A received failure is not a network error: notify the platform for resolution;
-        // do not retry it or try alternative configurations.
-        if (response?.error?.length || response?.success === false) {
-            throw new Error('The cloud API rejected the scale-out request.');
-        }
-        console.log(`[@cocreate/autoscaler] [SCALE-OUT] Provisioning server ${serverId}.`);
-        return response;
-    } catch (error) {
-        console.error('[@cocreate/autoscaler] Scale-out failed; platform notification pending:', {
-            server_id: serverId, cluster_id: server.cluster_id,
-            error_code: error?.cause?.code || error?.code || error?.name
-        });
-        await server.crud.send({
-            method: 'object.update',
-            array: 'servers',
-            object: { _id: serverId, master: { status: 'failed' } },
-            organization_id: server.organization_id,
-            host: server.host
-        });
-        throw error;
-    }
+    return server.manager?.organization_id
+        ? server.manager.send(payload)
+        : server.workflow.run(payload);
 }
 
 /**
@@ -670,8 +614,8 @@ function checkScaleInCapacity(snapshot, candidateId, observedAfter) {
         const isCandidate = String(item._id) === String(candidateId);
         if (observedAfter && isCandidate) continue;
         const metrics = snapshot.serverMetrics.get(String(item._id));
-        const vCPU = Number(item.infrastructure?.vCPU || item.vCPU);
-        const memoryGb = Number(item.infrastructure?.memoryGb || item.memoryGb);
+        const vCPU = Number(item.deployment?.vCPU || item.vCPU);
+        const memoryGb = Number(item.deployment?.memoryGb || item.memoryGb);
         if (!metrics || ![vCPU, memoryGb].every(value => Number.isFinite(value) && value > 0) ||
             ![metrics.cpu, metrics.memory].every(value => Number.isFinite(value) && value >= 0)) {
             return { ok: false, reason: 'Fresh telemetry and instance capacity are required for every node.' };
@@ -742,6 +686,7 @@ async function sendDrain(serverId, value) {
  *
  * @param {Object} [targetServer] - Optional target server document to decommission
  * @param {Object} [options] - Selection options; organization inactivity selects strategy local.
+ * @param {Object} [coordinates] - Organization location when input is a target cluster
  * @returns {Promise<Object>} API execution result payload
  * @public
  * @environment server
@@ -774,20 +719,16 @@ export async function scaleIn(targetServer, options) {
     }
 
 
-    const apiId = candidateServer.cloud || candidateServer.infrastructure?.cloud ||
-        candidateServer.api_id || candidateServer.infrastructure?.api_id;
+    const apiId = candidateServer.deployment?.cloud || candidateServer.cloud ||
+        candidateServer.api_id || candidateServer.deployment?.api_id;
     const api = allowedApis.find(item => String(item._id) === String(apiId));
     if (!api) throw new Error('The server cloud API is not allowed by the cluster clouds.');
     const provider = api.name;
-    const vmId = candidateServer.infrastructure?.instanceId || candidateServer.infrastructure?.vmId || candidateServer.vmId;
-    const region = candidateServer.infrastructure?.region || candidateServer.region;
+    const deploymentId = candidateServer.deployment?.id;
+    const region = candidateServer.deployment?.region || candidateServer.region;
 
-    // Retrieve delete endpoint directly from autoscaleConfig
-    const endpoint = getValueFromObject(autoscaleConfig, `clouds.${api.provider}.endpoint.delete`) ||
-        getValueFromObject(autoscaleConfig, 'endpoint.delete');
-    const method = getValueFromObject(autoscaleConfig, `clouds.${api.provider}.method.delete`);
-    if (!endpoint) throw new Error(`No delete endpoint is configured for ${api.provider}.`);
-    if (!vmId || !region) throw new Error('The scale-in candidate needs a VM ID and region.');
+    if (!clusterConfig?._id) throw new Error('Scale-in requires the saved cluster configuration.');
+    if (!deploymentId || !region) throw new Error('The scale-in candidate needs an deployment ID and region.');
     const drainWaitSeconds = Number(getValueFromObject(autoscaleConfig, 'scaleIn.drainWaitSeconds'));
     if (!Number.isInteger(drainWaitSeconds) || drainWaitSeconds < 1) {
         throw new Error('Scale-in requires a configured drain observation interval.');
@@ -805,21 +746,14 @@ export async function scaleIn(targetServer, options) {
         return null;
     }
 
-    console.log(`[@cocreate/autoscaler] [SCALE-IN] Draining node [${vmId}] before provider [${provider}] termination.`);
+    console.log(`[@cocreate/autoscaler] [SCALE-IN] Draining node [${deploymentId}] before provider [${provider}] termination.`);
 
-    const apiPayload = {
-        api: provider,
-        ...(method && { method }),
-        endpoint,
-        organization_id: server.organization_id,
-        host: server.host,
-        region,
-        data: {
-            server_id: candidateServer._id,
-            cluster_id: server.cluster_id,
-            vmId: vmId,
-            provider: api.provider,
-            region
+    const targetCluster = {
+        ...clusterConfig,
+        deployment: {
+            cloud: apiId, region, type: candidateServer.deployment?.type,
+            dns: candidateServer.deployment?.dns || [],
+            server_id: candidateServer._id, id: deploymentId
         }
     };
 
@@ -862,13 +796,13 @@ export async function scaleIn(targetServer, options) {
 
     // Commit retirement before provider dispatch so normal State saves preserve it.
     await setMasterStatus(candidateServer._id, 'terminating');
-    console.log(`[@cocreate/autoscaler] [SCALE-IN] Sending termination request for node [${vmId}] to provider [${provider}] endpoint [${endpoint}].`);
+    console.log(`[@cocreate/autoscaler] [SCALE-IN] Sending termination request for node [${deploymentId}] through workflow.deleteOrganizationServer.`);
     let response;
     let terminationError;
     try {
         for (let attempt = 0; attempt < 2; attempt++) {
             try {
-                response = await (server.manager?.organization_id ? server.manager.send(apiPayload) : server.api.send(apiPayload));
+                response = await runWorkflow('deleteOrganizationServer', targetCluster);
                 break;
             } catch (error) {
                 const code = error?.cause?.code || error?.code;
@@ -926,7 +860,7 @@ function placementLocations(sample) {
     if (Array.isArray(clients) && clients.length) return clients;
 
     // A server location is a fallback until client geography is supplied by telemetry.
-    const location = server.location || {};
+    const location = server.deployment?.location || {};
     if (Number.isFinite(Number(location.latitude)) && Number.isFinite(Number(location.longitude))) {
         return [{
             latitude: Number(location.latitude),
@@ -1064,6 +998,61 @@ async function onTelemetry(message) {
     }
 }
 
+/** Place the first node using the organization location instead of traffic density. */
+async function onOrganizationPeers({ organization_id, peers } = {}) {
+    if (!organization_id || organization_id === server.organization_id || !Array.isArray(peers) || peers.length) return;
+    try {
+        const response = await server.crud.send({
+            method: 'object.read', array: 'clusters', organization_id: server.organization_id, host: server.host,
+            filter: { query: { type: 'organization', managedOrganization: organization_id }, limit: 1 }
+        });
+        if (!response || response.success === false || response.error?.length || !Array.isArray(response.object)) {
+            throw new Error('Unable to read the organization cluster.');
+        }
+        const cluster = response.object[0];
+        if (!cluster) return;
+        const organizationResponse = await server.crud.send({
+            method: 'object.read', array: 'organizations', organization_id: server.organization_id, host: server.host,
+            filter: { query: { _id: organization_id }, limit: 1 }
+        });
+        if (!organizationResponse || organizationResponse.success === false ||
+            (Array.isArray(organizationResponse.error) ? organizationResponse.error.length : organizationResponse.error) ||
+            !Array.isArray(organizationResponse.object)) throw new Error('Unable to read the organization location.');
+        const result = await scaleOut(cluster, [], organizationResponse.object[0]?.location);
+        if (!result.data?.server?._id || !result.data.id) throw new Error('Provisioning returned no server or deployment ID.');
+        watchStartup(result.data.server._id);
+    } catch (error) {
+        console.error('[@cocreate/autoscaler] Organization cluster startup failed:', {
+            organization_id, error_code: error?.cause?.code || error?.code || error?.name
+        });
+    }
+}
+
+/** Check persisted readiness after two minutes; another platform worker may receive the update. */
+function watchStartup(serverId) {
+    const timer = setTimeout(async () => {
+        if (server.state?.isShuttingDown) return;
+        try {
+            const response = await server.crud.send({
+                method: 'object.read', array: 'servers',
+                organization_id: server.organization_id, host: server.host,
+                filter: { query: { _id: serverId }, limit: 1 }
+            });
+            if (!response || response.error?.length || response.success === false || !Array.isArray(response.object)) throw new Error('Unable to read startup state.');
+            const record = response.object.find(record => String(record._id) === serverId);
+            const reported = record && (
+                (typeof record.master?.status === 'string' && record.master.status !== 'provisioning') ||
+                Object.entries(record).some(([key, value]) => /^worker\d+$/.test(key) && typeof value?.status === 'string')
+            );
+            // TODO: Notify the platform and consider at most one replacement.
+            if (!reported) console.error('[@cocreate/cluster] No managed startup update received within two minutes:', serverId);
+        } catch {
+            console.error('[@cocreate/cluster] Unable to verify managed startup update:', serverId);
+        }
+    }, 120000);
+    timer.unref?.();
+}
+
 /**
  *
  * @public
@@ -1077,6 +1066,10 @@ export async function init(serverInstance) {
     server = serverInstance;
     await loadAutoscaleConfig();
     organizationIdle = false;
+    const manager = config.get('manager') || {};
+    if (manager.enabled === true && manager.organization_id === server.organization_id) {
+        server.on('organizationPeers', onOrganizationPeers);
+    }
     server.on('telemetry', onTelemetry);
     server.on('orgDisconnected', onOrganizationDisconnected);
     server.on('orgConnected', message => {
@@ -1090,6 +1083,7 @@ export async function init(serverInstance) {
     return {
         config: autoscaleConfig,
         scaleOut,
+        determineDeployment,
         determineScaleOutTarget,
         scaleIn,
         determineScaleInTarget,
