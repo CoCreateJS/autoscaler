@@ -133,7 +133,7 @@ Configure the autoscaler with the following policy structure. Cloud-provider con
 `vertical.min` defines the first server size and `vertical.max` defines the upper resource boundary. The autoscaler can add up to `maxNodesPerTier` regional servers at the current size. Once that count is reached, the next target doubles the current vCPU and memory values, capped independently by their configured maximums. The cloud adapter then selects the smallest available provider instance that satisfies both target values.
 
 `getDensityTarget` calculates the demand centroid using the existing global or
-continent-based policy. When enabled, scoped `servers_config` records of type
+continent-based policy. When enabled, scoped `configs` records of type
 `dns` provide eligible locations. The autoscaler chooses one nearest POP per DNS connection,
 sorts the selections by their exact distance from the demand centroid, and uses the first
 POP to select the nearest allowed cloud region.
@@ -284,7 +284,7 @@ except for the current deployment. Provider workflows consume the saved script.
 `cluster.clouds` and `cluster.dns` are optional API-ID whitelists. Missing values,
 empty strings and empty arrays allow all enabled API connections of the corresponding
 type in the executing organization. Nonempty selections restrict API records by ID;
-a single ID string is also accepted. Matching `clouds` and `dns` server configs
+a single ID string is also accepted. Matching `clouds` and `dns` configs
 supply catalogs, which are filtered through those connections. Multiple connections
 for one DNS provider keep separate POP entries identified by `apiId`.
 

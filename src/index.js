@@ -45,7 +45,7 @@ function isAutoscalingEnabled() {
 
 /**
  * Uses this server's cluster as the baseline, then applies matching system and
- * servers_config records in their configured order.
+ * configs records in their configured order.
  *
  * Autoscaler is the sole module responsible for loading and resolving configuration early
  * in the pipeline before passing the resolved object to downstream modules like GeoScaling.

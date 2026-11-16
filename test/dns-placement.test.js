@@ -6,7 +6,7 @@ import { getCloudProvider, getDensityTarget, selectPlacement, loadCloudProviders
 import { query } from '../../config/src/core.js';
 import { dotNotationToObject } from '../../utils/src/modules/dotNotationToObject.js';
 import { getValueFromObject } from '../../utils/src/modules/getValueFromObject.js';
-import bunnySeed from '../../../CoCreate-app/src/apps/server-configs/config/dns/bunny.js';
+import bunnySeed from '../../../CoCreate-app/src/apps/configs/config/dns/bunny.js';
 
 const clients = [{ latitude: 0, longitude: 0, count: 100, continent: 'AF' }];
 const instances = [{ name: 'small', vCPU: 2, memoryGb: 4, default: true }];
@@ -133,7 +133,7 @@ test('scoped enabled catalogs load separately and drive placement through VM siz
     assert.equal(result.type, 'small');
     assert.equal(result.vCPU, 2);
     assert.equal(result.memoryGb, 4);
-    for (const request of requests.filter(item => item.array === 'servers_config')) {
+    for (const request of requests.filter(item => item.array === 'configs')) {
         assert.equal(request.organization_id, 'tenant-1');
         assert.equal(request.filter.query.enabled, true);
         assert.notEqual(request.filter.query.type, 'startupscript');
