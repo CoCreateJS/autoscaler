@@ -6,7 +6,7 @@ import { getCloudProvider, getDensityTarget, selectPlacement, loadCloudProviders
 import { query } from '../../config/src/core.js';
 import { dotNotationToObject } from '../../utils/src/modules/dotNotationToObject.js';
 import { getValueFromObject } from '../../utils/src/modules/getValueFromObject.js';
-import bunnySeed from '../../../CoCreate-app/src/apps/configs/config/dns/bunny.js';
+import bunnySeed from '../../../app/src/apps/configs/config/dns/bunny.js';
 
 const clients = [{ latitude: 0, longitude: 0, count: 100, continent: 'AF' }];
 const instances = [{ name: 'small', vCPU: 2, memoryGb: 4, default: true }];
