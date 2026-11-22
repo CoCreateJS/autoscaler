@@ -5,6 +5,7 @@ const vm = require('node:vm');
 const source = fs.readFileSync(require.resolve('../src/index.js'), 'utf8');
 const plain = value => JSON.parse(JSON.stringify(value));
 const getValueFromObject = (object, path) => path.split('.').reduce((value, key) => value?.[key], object);
+const memoryAverage = sample => sample?.memory?.avg ?? sample?.memory?.avg_used_pct;
 function extract(name, next = '\n/**') {
     const start = source.indexOf(`async function ${name}(`);
     return source.slice(start, source.indexOf(next, start));
@@ -22,7 +23,7 @@ async function snapshot(currentSample) {
     const samples = records.map(record => ({
         serverId: record._id, workerId: 1, timestamp: now,
         cpu: { avg: record._id === 'node-0' ? 20 : record._id === 'node-1' ? 40 : 99 },
-        memory: { avg_used_pct: record._id === 'node-0' ? 30 : record._id === 'node-1' ? 50 : 99 }
+        memory: { avg: record._id === 'node-0' ? 30 : record._id === 'node-1' ? 50 : 99 }
     }));
     const reads = [];
     const server = { id: 'node-0', cluster_id: 'cluster-1', organization_id: 'tenant', host: 'tenant.test', crud: {
@@ -37,7 +38,7 @@ async function snapshot(currentSample) {
             return { object: samples.filter(sample => query.serverId.$in.includes(sample.serverId) && sample.timestamp >= query.timestamp.$gte) };
         }
     } };
-    const context = vm.createContext({ server });
+    const context = vm.createContext({ server, memoryAverage });
     vm.runInContext(extract('getClusterDetails'), context);
     return { snapshot: await context.getClusterDetails({}, currentSample), reads };
 }
@@ -58,8 +59,8 @@ test('only running masters supply load and active capacity; departing nodes stay
 
 test('a fresh local sample from a terminating master cannot reenter capacity calculations', async () => {
     const { snapshot: result } = await snapshot({
-        serverId: 'node-3', workerId: 1, timestamp: new Date().toISOString(), interval_seconds: 60,
-        cpu: { avg: 100 }, memory: { avg_used_pct: 100 }
+        serverId: 'node-3', workerId: 1, timestamp: new Date().toISOString(), interval: 60000,
+        cpu: { avg: 100 }, memory: { avg: 100 }
     });
     assert.equal(result.avgCpu, 30);
     assert.equal(result.avgMemory, 40);
@@ -127,7 +128,7 @@ test('scale-out placement excludes non-running masters from an explicit caller s
 test('a non-running local master does not coordinate a new scaling decision', async () => {
     let actions = 0;
     const context = vm.createContext({
-        server: { id: 'stopped-local', cluster_id: 'cluster-1' }, isAutoscalingEnabled: () => true, getValueFromObject,
+        server: { id: 'stopped-local', cluster_id: 'cluster-1' }, isAutoscalingEnabled: () => true, getValueFromObject, memoryAverage,
         autoscaleConfig: { scaleOut: { cpuThreshold: 80, memoryThreshold: 80, consecutiveFlushes: 1, maxClusterSize: 0 },
             scaleIn: { cpuThreshold: 10, memoryThreshold: 10, consecutiveFlushes: 1, minClusterSize: 0 } },
         organizationIdle: false,
@@ -140,6 +141,6 @@ test('a non-running local master does not coordinate a new scaling decision', as
     });
     vm.runInContext(extract('onTelemetry'), context);
     await context.onTelemetry({ data: { serverId: 'stopped-local', workerId: 1, timestamp: new Date().toISOString(),
-        interval_seconds: 1, cpu: { avg: 99 }, memory: { avg_used_pct: 99 } } });
+        interval: 1000, cpu: { avg: 99 }, memory: { avg: 99 } } });
     assert.equal(actions, 0);
 });

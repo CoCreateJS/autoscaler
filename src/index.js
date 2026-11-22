@@ -186,7 +186,8 @@ async function getClusterDetails(query = {}, currentSample) {
     const pendingCount = pendingResponse?.object?.length || 0;
 
     // Telemetry is written to its own collection, not embedded in servers.
-    const interval = Number(currentSample?.interval_seconds) * 1000 || 60000;
+    const interval = Number(currentSample?.interval) ||
+        Number(currentSample?.interval_seconds) * 1000 || 60000;
     const since = new Date(Date.now() - interval * 2).toISOString();
     const ids = activeServers.map(item => String(item._id));
     const telemetryResponse = ids.length ? await server.crud.send({
@@ -215,7 +216,7 @@ async function getClusterDetails(query = {}, currentSample) {
         const id = String(sample.serverId);
         const entry = byServer.get(id) || { cpu: 0, memory: 0, workers: 0, timestamp: '' };
         entry.cpu += Number(sample.cpu?.avg || 0);
-        entry.memory += Number(sample.memory?.avg_used_pct || 0);
+        entry.memory += Number(memoryAverage(sample) || 0);
         entry.workers++;
         if (!entry.timestamp || sample.timestamp < entry.timestamp) entry.timestamp = sample.timestamp;
         byServer.set(id, entry);
@@ -226,7 +227,7 @@ async function getClusterDetails(query = {}, currentSample) {
         timestamp: entry.timestamp
     }]));
     const totalCpu = samples.reduce((sum, item) => sum + Number(item.cpu?.avg || 0), 0);
-    const totalMem = samples.reduce((sum, item) => sum + Number(item.memory?.avg_used_pct || 0), 0);
+    const totalMem = samples.reduce((sum, item) => sum + Number(memoryAverage(item) || 0), 0);
     const count = samples.length || 1;
 
     return {
@@ -843,6 +844,10 @@ function thresholdBelow(value, threshold) {
     return Number.isFinite(Number(threshold)) && Number(value) < Number(threshold);
 }
 
+function memoryAverage(sample) {
+    return sample?.memory?.avg ?? sample?.memory?.avg_used_pct;
+}
+
 function isScaleInCoordinator(snapshot, policy) {
     // Every node chooses from the same cluster snapshot. The lowest-ID node
     // with low local load coordinates this decision; the configured strategy still
@@ -909,7 +914,7 @@ async function onTelemetry(message) {
     const outPolicy = getValueFromObject(autoscaleConfig, 'scaleOut') || {};
     const inPolicy = getValueFromObject(autoscaleConfig, 'scaleIn') || {};
     const cpu = Number(sample.cpu?.avg);
-    const memory = Number(sample.memory?.avg_used_pct);
+    const memory = Number(memoryAverage(sample));
     if (!Number.isFinite(cpu) || !Number.isFinite(memory)) return;
 
     const out = thresholdReached(cpu, outPolicy.cpuThreshold) ||
@@ -929,7 +934,8 @@ async function onTelemetry(message) {
         (Number.isInteger(outFlushes) && outFlushes > 0 && streak.out >= outFlushes) ||
         (Number.isInteger(inFlushes) && inFlushes > 0 && streak.in >= inFlushes);
     const minimum = Number(inPolicy.minClusterSize);
-    const intervalMs = Math.max(1000, Number(sample.interval_seconds || 60) * 1000);
+    const intervalMs = Math.max(1000,
+        Number(sample.interval) || Number(sample.interval_seconds) * 1000 || 60000);
     const floorRefreshMs = intervalMs * Math.max(1, inFlushes || 1);
     const needsFloorCheck = Number.isInteger(minimum) && minimum > 0 &&
         (floorLeader !== false || Date.now() - lastFloorCheckAt >= floorRefreshMs) &&
