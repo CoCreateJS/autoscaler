@@ -52,7 +52,7 @@ async function setup(t, { managed = true, reject = false, networkFailures = 0, n
         allowedApis: [{ _id: 'cloud-id', name: 'parent-cloud', provider: 'aws' }],
         getClusterDetails: async () => ({ totalCount: 1, servers: [candidate], removingServers: [] }),
         checkScaleInCapacity: () => { order.push('capacity'); return { ok: true }; },
-        setMasterStatus: async (id, status) => order.push(status),
+        setPrimaryStatus: async (id, status) => order.push(status),
         sendDrain: async (id, value) => order.push(`drain:${value}`),
         setTimeout: callback => callback(), console: { log() {}, error() {} }
     });
@@ -116,23 +116,23 @@ test('scale-out rejects malformed or failed workflow responses', async t => {
     }
 });
 
-test('AutoScaler writes removal status to master.status without replacing the master object', async () => {
+test('AutoScaler writes removal status to primary.status without replacing the primary object', async () => {
     const writes = [];
     const server = { organization_id: 'tenant', host: 'tenant.test', crud: { send: async request => {
         writes.push(plain(request));
         return { object: [request.object] };
     } } };
-    const start = source.indexOf('async function setMasterStatus(');
+    const start = source.indexOf('async function setPrimaryStatus(');
     const end = source.indexOf('\nasync function sendDrain(', start);
     const context = vm.createContext({ server });
     vm.runInContext(source.slice(start, end), context);
-    await context.setMasterStatus('server-1', 'terminating');
+    await context.setPrimaryStatus('server-1', 'terminating');
     assert.deepEqual(writes, [{ method: 'object.update', array: 'servers', object: {
-        _id: 'server-1', 'master.status': 'terminating'
+        _id: 'server-1', 'primary.status': 'terminating'
     }, organization_id: 'tenant', host: 'tenant.test' }]);
 });
 
-test('cluster snapshots include draining and terminating masters for removal coordination', async () => {
+test('cluster snapshots include draining and terminating primaries for removal coordination', async () => {
     const reads = [];
     const server = { id: 'server-1', cluster_id: 'cluster-1', organization_id: 'tenant', host: 'tenant.test', crud: {
         send: async request => { reads.push(plain(request)); return { object: [] }; }
@@ -143,7 +143,7 @@ test('cluster snapshots include draining and terminating masters for removal coo
     vm.runInContext(source.slice(start, end), context);
     await context.getClusterDetails();
     assert.deepEqual(reads[0].filter.query, {
-        'master.status': { $in: ['running', 'draining', 'terminating'] }, cluster_id: 'cluster-1'
+        'primary.status': { $in: ['running', 'draining', 'terminating'] }, cluster_id: 'cluster-1'
     });
 });
 
@@ -154,7 +154,7 @@ for (const managed of [true, false]) {
         assert.equal(calls.filter(call => !call.shutdown).length, 2);
         assert.ok(order.indexOf('terminating') < order.indexOf('send'));
             assert.deepEqual(order.slice(-2), ['send', 'shutdown']);
-        assert.deepEqual(calls.at(-1).shutdown, { server: 'server-1', master: true, organization_id: 'tenant' });
+        assert.deepEqual(calls.at(-1).shutdown, { server: 'server-1', primary: true, organization_id: 'tenant' });
     });
     test(`exhausted termination retries mark failed then shutdown (managed=${managed})`, async t => {
         const { context, calls, order } = await setup(t, { managed, networkFailures: 2 });
@@ -178,24 +178,24 @@ test('cancelled capacity observation restores service without terminating or shu
     assert.deepEqual(order.slice(-2), ['drain:false', 'running']);
 });
 
-test('terminal master status is mirrored before shutdown can proceed', async () => {
+test('terminal primary status is mirrored before shutdown can proceed', async () => {
     const order = [];
     const server = { organization_id: 'tenant', host: 'tenant.test', crud: { send: async request => {
         order.push(['local', plain(request)]);
         return { object: [request.object] };
     } }, manager: { organization_id: 'parent', send: async request => order.push(['manager', plain(request)]) } };
-    const start = source.indexOf('async function setMasterStatus(');
+    const start = source.indexOf('async function setPrimaryStatus(');
     const end = source.indexOf('\nasync function sendDrain(', start);
     const context = vm.createContext({ server, console });
     vm.runInContext(source.slice(start, end), context);
-    await context.setMasterStatus('target-server', 'failed');
+    await context.setPrimaryStatus('target-server', 'failed');
     assert.deepEqual(order.map(item => item[0]), ['local', 'manager']);
     assert.deepEqual(order[0][1], order[1][1]);
-    assert.equal(order[1][1].object['master.status'], 'failed');
+    assert.equal(order[1][1].object['primary.status'], 'failed');
 });
 test('failure to commit terminating prevents the provider request and shutdown', async t => {
     const { context, order } = await setup(t);
-    context.setMasterStatus = async (id, status) => {
+    context.setPrimaryStatus = async (id, status) => {
         order.push(status);
         if (status === 'terminating') throw new Error('Inventory unavailable.');
     };

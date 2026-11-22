@@ -28,7 +28,7 @@ export async function collectTerminatingServers(server) {
     if (!server.cluster_id) throw new Error('Server inventory cleanup requires a cluster ID.');
     const response = await server.crud.send({
         method: 'object.read', array: 'servers',
-        filter: { query: { cluster_id: server.cluster_id, 'master.status': 'terminating' }, limit: 0 },
+        filter: { query: { cluster_id: server.cluster_id, 'primary.status': 'terminating' }, limit: 0 },
         organization_id: server.organization_id, host: server.host
     });
     if (failed(response) || !Array.isArray(response.object)) {

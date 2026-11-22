@@ -9,11 +9,11 @@ import { init } from '../src/index.js';
 function setup(managed = false) {
     const calls = [];
     const records = new Map([
-        ['terminating', { _id: 'terminating', cluster_id: 'cluster', master: { status: 'terminating' } }],
-        ['failed', { _id: 'failed', cluster_id: 'cluster', master: { status: 'failed' } }],
-        ['running', { _id: 'running', cluster_id: 'cluster', master: { status: 'running' } }],
-        ['provisioning', { _id: 'provisioning', cluster_id: 'cluster', master: { status: 'provisioning' } }],
-        ['other', { _id: 'other', cluster_id: 'other-cluster', master: { status: 'terminating' } }]
+        ['terminating', { _id: 'terminating', cluster_id: 'cluster', primary: { status: 'terminating' } }],
+        ['failed', { _id: 'failed', cluster_id: 'cluster', primary: { status: 'failed' } }],
+        ['running', { _id: 'running', cluster_id: 'cluster', primary: { status: 'running' } }],
+        ['provisioning', { _id: 'provisioning', cluster_id: 'cluster', primary: { status: 'provisioning' } }],
+        ['other', { _id: 'other', cluster_id: 'other-cluster', primary: { status: 'terminating' } }]
     ]);
     const server = {
         mesh: new EventEmitter(),
@@ -24,7 +24,7 @@ function setup(managed = false) {
             if (request.method === 'object.read') {
                 const query = request.filter.query;
                 return { object: [...records.values()].filter(record => query._id ? record._id === query._id :
-                    record.cluster_id === query.cluster_id && record.master.status === query['master.status']) };
+                    record.cluster_id === query.cluster_id && record.primary.status === query['primary.status']) };
             }
             const deleted = request.object.flatMap(({ _id }) => {
                 const record = records.get(_id);
@@ -46,7 +46,7 @@ test('sweep deletes only its own terminating inventory and does not reread each 
     await collectTerminatingServers(server);
     assert.deepEqual([...records.keys()], ['failed', 'running', 'provisioning', 'other']);
     assert.deepEqual(calls.map(call => call.method), ['object.read', 'object.delete']);
-    assert.deepEqual(calls[0].filter.query, { cluster_id: 'cluster', 'master.status': 'terminating' });
+    assert.deepEqual(calls[0].filter.query, { cluster_id: 'cluster', 'primary.status': 'terminating' });
     assert.equal(calls[1].organization_id, 'tenant');
 });
 
@@ -111,7 +111,7 @@ test('AutoScaler init schedules the first sweep at ten minutes and repeats, even
     t.mock.method(config, 'query', async () => undefined);
     const { server, calls, records } = setup();
     const autoscaler = await init(server);
-    const sweeps = () => calls.filter(call => call.filter?.query['master.status'] === 'terminating');
+    const sweeps = () => calls.filter(call => call.filter?.query['primary.status'] === 'terminating');
     assert.equal(typeof autoscaler.deleteServer, 'function');
     assert.equal(sweeps().length, 0);
     t.mock.timers.tick(599999);

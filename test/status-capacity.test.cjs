@@ -14,11 +14,11 @@ function extract(name, next = '\n/**') {
 async function snapshot(currentSample) {
     const statuses = ['running', 'running', 'draining', 'terminating', 'stopped', 'failed', 'terminated', 'provisioning'];
     const records = statuses.map((status, i) => ({
-        _id: `node-${i}`, cluster_id: 'cluster-1', master: { status },
+        _id: `node-${i}`, cluster_id: 'cluster-1', primary: { status },
         worker1: { status: 'stopped', isDraining: true, isCordoned: true },
         deployment: { vCPU: i < 2 ? 2 : 1000, memoryGb: i < 2 ? 8 : 1000 }
     }));
-    records.push({ _id: 'other-cluster', cluster_id: 'other', master: { status: 'running' } });
+    records.push({ _id: 'other-cluster', cluster_id: 'other', primary: { status: 'running' } });
     const now = new Date().toISOString();
     const samples = records.map(record => ({
         serverId: record._id, workerId: 1, timestamp: now,
@@ -31,9 +31,9 @@ async function snapshot(currentSample) {
             reads.push(plain(request));
             const query = request.filter.query;
             if (request.array === 'servers') {
-                const status = query['master.status'];
+                const status = query['primary.status'];
                 return { object: records.filter(record => record.cluster_id === query.cluster_id &&
-                    (typeof status === 'string' ? record.master.status === status : status.$in.includes(record.master.status))) };
+                    (typeof status === 'string' ? record.primary.status === status : status.$in.includes(record.primary.status))) };
             }
             return { object: samples.filter(sample => query.serverId.$in.includes(sample.serverId) && sample.timestamp >= query.timestamp.$gte) };
         }
@@ -43,7 +43,7 @@ async function snapshot(currentSample) {
     return { snapshot: await context.getClusterDetails({}, currentSample), reads };
 }
 
-test('only running masters supply load and active capacity; departing nodes stay separate', async () => {
+test('only running primaries supply load and active capacity; departing nodes stay separate', async () => {
     const { snapshot: result, reads } = await snapshot();
     assert.deepEqual(plain(result.servers.map(record => record._id)), ['node-0', 'node-1']);
     assert.deepEqual(plain(result.removingServers.map(record => record._id)), ['node-2', 'node-3']);
@@ -57,7 +57,7 @@ test('only running masters supply load and active capacity; departing nodes stay
     assert.equal(result.serverMetrics.get('node-0').cpu, 20, 'Worker flags do not exclude running-node telemetry');
 });
 
-test('a fresh local sample from a terminating master cannot reenter capacity calculations', async () => {
+test('a fresh local sample from a terminating primary cannot reenter capacity calculations', async () => {
     const { snapshot: result } = await snapshot({
         serverId: 'node-3', workerId: 1, timestamp: new Date().toISOString(), interval: 60000,
         cpu: { avg: 100 }, memory: { avg: 100 }
@@ -73,7 +73,7 @@ function capacityContext(minimum) {
         autoscaleConfig: { scaleIn: { minClusterSize: minimum }, scaleOut: { cpuThreshold: 90, memoryThreshold: 90 } },
         getValueFromObject
     });
-    vm.runInContext(source.slice(source.indexOf('function checkScaleInCapacity('), source.indexOf('\nasync function setMasterStatus(')), context);
+    vm.runInContext(source.slice(source.indexOf('function checkScaleInCapacity('), source.indexOf('\nasync function setPrimaryStatus(')), context);
     return context;
 }
 
@@ -89,20 +89,20 @@ test('the candidate draining does not block its own post-drain capacity observat
     const { snapshot: result } = await snapshot();
     result.pendingCount = 0;
     result.servers = result.servers.filter(record => record._id === 'node-1');
-    result.removingServers = [{ _id: 'node-0', master: { status: 'draining' } }];
+    result.removingServers = [{ _id: 'node-0', primary: { status: 'draining' } }];
     const decision = capacityContext(1).checkScaleInCapacity(result, 'node-0', new Date(Date.now() - 1000).toISOString());
     assert.equal(decision.ok, true);
-    result.removingServers.push({ _id: 'node-3', master: { status: 'terminating' } });
+    result.removingServers.push({ _id: 'node-3', primary: { status: 'terminating' } });
     assert.equal(capacityContext(1).checkScaleInCapacity(result, 'node-0').ok, false);
 });
 
 test('final-node capacity still permits zero only when the configured minimum is zero', () => {
-    const result = { servers: [], pendingCount: 0, removingServers: [{ _id: 'candidate', master: { status: 'draining' } }], serverMetrics: new Map() };
+    const result = { servers: [], pendingCount: 0, removingServers: [{ _id: 'candidate', primary: { status: 'draining' } }], serverMetrics: new Map() };
     assert.equal(capacityContext(0).checkScaleInCapacity(result, 'candidate', new Date().toISOString()).ok, true);
     assert.equal(capacityContext(1).checkScaleInCapacity(result, 'candidate', new Date().toISOString()).ok, false);
 });
 
-test('scale-out placement excludes non-running masters from an explicit caller snapshot', async () => {
+test('scale-out placement excludes non-running primaries from an explicit caller snapshot', async () => {
     let existingNodes;
     const profile = { provider: 'aws', region: 'region-1', instances: [{ name: 'small', vCPU: 2, memoryGb: 2, default: true }] };
     const context = vm.createContext({
@@ -118,14 +118,14 @@ test('scale-out placement excludes non-running masters from an explicit caller s
     });
     vm.runInContext(extract('determineScaleOutTarget'), context);
     await context.determineScaleOutTarget([], [
-        { master: { status: 'running' }, deployment: { location: { continent: 'NA' } } },
-        { master: { status: 'terminating' }, deployment: { location: { continent: 'EU' } } },
-        { master: { status: 'stopped' }, deployment: { location: { continent: 'AS' } } }
+        { primary: { status: 'running' }, deployment: { location: { continent: 'NA' } } },
+        { primary: { status: 'terminating' }, deployment: { location: { continent: 'EU' } } },
+        { primary: { status: 'stopped' }, deployment: { location: { continent: 'AS' } } }
     ]);
     assert.deepEqual(existingNodes, [{ continent: 'NA' }]);
 });
 
-test('a non-running local master does not coordinate a new scaling decision', async () => {
+test('a non-running local primary does not coordinate a new scaling decision', async () => {
     let actions = 0;
     const context = vm.createContext({
         server: { id: 'stopped-local', cluster_id: 'cluster-1' }, isAutoscalingEnabled: () => true, getValueFromObject, memoryAverage,

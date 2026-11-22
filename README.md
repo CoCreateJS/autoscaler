@@ -1,6 +1,6 @@
 # CoCreate Server Autoscaler
 
-A decentralized, self-healing, and autonomous cluster lifecycle manager designed for high-performance multi-tenant ecosystems. Driven directly by real-time telemetry metrics, this module orchestrates vertical and horizontal scaling across top cloud providers using a peer-to-peer, masterless replication model.
+A decentralized, self-healing, and autonomous cluster lifecycle manager designed for high-performance multi-tenant ecosystems. Driven directly by real-time telemetry metrics, this module orchestrates vertical and horizontal scaling across top cloud providers using a peer-to-peer, decentralized replication model.
 
 ---
 
@@ -10,7 +10,7 @@ For advanced cloud provider configurations, identity IAM role policies, and thre
 
 ## Table of Contents
 
-* [The Masterless Replicating Node Architecture](#the-masterless-replicating-node-architecture)
+* [The decentralized Replicating Node Architecture](#the-decentralized-replicating-node-architecture)
 * [Why CoCreate Server Autoscaler?](#why-cocreate-autoscaler)
 * [Vertical & Horizontal Multi-Cloud Adaptability](#vertical--horizontal-multi-cloud-adaptability)
 * [Self-Healing & Telemetry-Driven Lifecycle](#self-healing--telemetry-driven-lifecycle)
@@ -24,14 +24,14 @@ For advanced cloud provider configurations, identity IAM role policies, and thre
 
 ---
 
-## The Masterless Replicating Node Architecture
+## The decentralized Replicating Node Architecture
 
-Traditional autoscaling relies on a centralized coordinator or a dedicated third-party master server (like a Kubernetes Control Plane or a custom Orchestrator VM) to monitor worker health and issue creation commands. If that master node crashes, the entire cluster's scaling capabilities freeze.
+Traditional autoscaling relies on a centralized coordinator or a dedicated third-party primary server (like a Kubernetes Control Plane or a custom Orchestrator VM) to monitor worker health and issue creation commands. If that primary node crashes, the entire cluster's scaling capabilities freeze.
 
 `@cocreate/autoscaler` implements a **Decentralized, Peer-to-Peer (P2P) Replication Model**:
 
-* **Every Node is Both Master and Worker:** There are no specialized roles. Each node independently monitors its own resource limits, registers its state within the shared platform database, and monitors peer health via the `@cocreate/server-mesh` Control Plane.
-* **Autonomous Self-Replication:** If a node detects cluster-wide saturation or localized system boundaries, it doesn't wait for a central master to act. It directly contacts your cloud provider's API to clone its own VM image, dynamically spawning an exact sibling node to scale out immediately:
+* **Every Node is Both Primary and Worker:** There are no specialized roles. Each node independently monitors its own resource limits, registers its state within the shared platform database, and monitors peer health via the `@cocreate/server-mesh` Control Plane.
+* **Autonomous Self-Replication:** If a node detects cluster-wide saturation or localized system boundaries, it doesn't wait for a central primary to act. It directly contacts your cloud provider's API to clone its own VM image, dynamically spawning an exact sibling node to scale out immediately:
 
 $$\text{Resource Boundary Tripped} \implies \text{Node } A \xrightarrow{\text{Direct Cloud API Call}} \text{Clone VM Image} \implies \text{Spawn Sibling Node } B$$
 
@@ -197,7 +197,7 @@ Upcoming enhancements planned for our autonomous scaling system include:
 
 ## How to Contribute
 
-We encourage contribution to our libraries (you might even score some nifty swag), please see our [CONTRIBUTING.md](https://github.com/CoCreateJS/autoscaler/blob/master/CONTRIBUTING.md) guide for details. If you encounter any bugs or wish to make feature requests, please submit an issue on our [GitHub Issues](https://github.com/CoCreateJS/autoscaler/issues) tracker. We want this library to be community-driven, and CoCreate led. We need your help to realize this goal.
+We encourage contribution to our libraries (you might even score some nifty swag), please see our [CONTRIBUTING.md](https://github.com/CoCreateJS/autoscaler/blob/primary/CONTRIBUTING.md) guide for details. If you encounter any bugs or wish to make feature requests, please submit an issue on our [GitHub Issues](https://github.com/CoCreateJS/autoscaler/issues) tracker. We want this library to be community-driven, and CoCreate led. We need your help to realize this goal.
 
 For broader system configurations and API guides, please visit our [CoCreate Server Autoscaler Documentation](https://cocreatejs.com/docs/autoscaler).
 
@@ -212,15 +212,15 @@ For broader system configurations and API guides, please visit our [CoCreate Ser
 
 `@cocreate/autoscaler` is maintained and funded by CoCreate. The names and logos for CoCreate are trademarks of CoCreate, LLC.
 
-## Master status and available capacity
+## Primary status and available capacity
 
-Available capacity and telemetry averages include only running masters. Provisioning is pending capacity. Draining/terminating masters are tracked separately for removal coordination; stopped, failed and terminated masters are excluded. Worker status and drain/cordon flags do not change server eligibility. State.save preserves failed/terminating outcomes by skipping subsequent State saves; scaling policy remains unchanged.
+Available capacity and telemetry averages include only running primaries. Provisioning is pending capacity. Draining/terminating primaries are tracked separately for removal coordination; stopped, failed and terminated primaries are excluded. Worker status and drain/cordon flags do not change server eligibility. State.save preserves failed/terminating outcomes by skipping subsequent State saves; scaling policy remains unchanged.
 
 
 ### Delayed server inventory cleanup
 
 Initialization schedules an own-cluster sweep every ten minutes, with no startup sweep.
-Retirement commits master.status terminating before the provider API call. Success retains
+Retirement commits primary.status terminating before the provider API call. Success retains
 that state; failure overrides it with failed. Only terminating records are selected for
 cleanup; failed records remain for investigation, and their Manager update cancels pending
 Manager cleanup directly.

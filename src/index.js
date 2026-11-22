@@ -149,9 +149,9 @@ export async function resolveClusterConfig(targetCluster) {
 }
 
 /**
- * Calculates running-master capacity and tracks departing masters separately for coordination.
+ * Calculates running-primary capacity and tracks departing primaries separately for coordination.
  *
- * @param {Object} [query={}] - Optional query filters to merge with default master status
+ * @param {Object} [query={}] - Optional query filters to merge with default primary status
  * @returns {Promise<Object>} Cluster snapshot including averages and raw active servers array
  * @private
  * @environment server
@@ -162,7 +162,7 @@ async function getClusterDetails(query = {}, currentSample) {
         array: 'servers',
         filter: {
             query: {
-                'master.status': { $in: ['running', 'draining', 'terminating'] },
+                'primary.status': { $in: ['running', 'draining', 'terminating'] },
                 ...query,
                 cluster_id: server.cluster_id
             }
@@ -173,12 +173,12 @@ async function getClusterDetails(query = {}, currentSample) {
 
     if (readResponse?.error?.length) throw new Error('Unable to read active cluster servers.');
     const clusterServers = readResponse?.object || [];
-    const activeServers = clusterServers.filter(item => item.master.status === 'running');
-    const removingServers = clusterServers.filter(item => ['draining', 'terminating'].includes(item.master.status));
+    const activeServers = clusterServers.filter(item => item.primary.status === 'running');
+    const removingServers = clusterServers.filter(item => ['draining', 'terminating'].includes(item.primary.status));
     const pendingResponse = await server.crud.send({
         method: 'object.read',
         array: 'servers',
-        filter: { query: { cluster_id: server.cluster_id, 'master.status': 'provisioning' }, limit: 0 },
+        filter: { query: { cluster_id: server.cluster_id, 'primary.status': 'provisioning' }, limit: 0 },
         organization_id: server.organization_id,
         host: server.host
     });
@@ -384,7 +384,7 @@ export async function determineScaleOutTarget(clientLocations, activeServers) {
     if (!isAutoscalingEnabled()) throw new Error("Autoscaling is disabled.");
     if (!server.cluster_id) throw new Error("Autoscaling requires a cluster ID.");
     const currentServers = (activeServers ?? (await getClusterDetails()).servers)
-        .filter(item => item.master.status === 'running');
+        .filter(item => item.primary.status === 'running');
     const isGeoEnabled = getValueFromObject(autoscaleConfig, 'geoScale.enabled');
     const sheddingThreshold = getValueFromObject(autoscaleConfig, 'geoScale.sheddingThreshold');
     if (isGeoEnabled === true && !Number.isFinite(Number(sheddingThreshold))) {
@@ -410,7 +410,7 @@ export async function determineDeployment(coordinates, activeServers = [], confi
             ...region, provider: api.name, providerType: api.provider, apiId: api._id
         }))
     );
-    const currentServers = activeServers.filter(item => item.master.status === 'running');
+    const currentServers = activeServers.filter(item => item.primary.status === 'running');
     const geoTarget = selectPlacement(coordinates, { cloudProviders, autoscaleConfig: placementConfig });
     const cloudRegion = geoTarget?.nearestCloudRegion;
     if (!cloudRegion) throw new Error('No configured region matches the enabled cluster providers.');
@@ -648,13 +648,13 @@ function checkScaleInCapacity(snapshot, candidateId, observedAfter) {
     return { ok: true };
 }
 
-async function setMasterStatus(serverId, status) {
+async function setPrimaryStatus(serverId, status) {
     const payload = {
         method: 'object.update',
         array: 'servers',
         object: {
             _id: serverId,
-            'master.status': status
+            'primary.status': status
         },
         organization_id: server.organization_id,
         host: server.host
@@ -677,7 +677,7 @@ async function sendDrain(serverId, value) {
     if (String(serverId) === String(server.id) && server.isWorker) {
         await server.state.drain(value);
     } else {
-        await server.send({ method: 'drain', server: serverId, broadcast: true, master: false, value });
+        await server.send({ method: 'drain', server: serverId, broadcast: true, primary: false, value });
     }
 }
 
@@ -761,7 +761,7 @@ export async function scaleIn(targetServer, options) {
     const startedAt = new Date().toISOString();
     let draining = false;
     try {
-        await setMasterStatus(candidateServer._id, 'draining');
+        await setPrimaryStatus(candidateServer._id, 'draining');
         // A partial delivery can still reach the target when dispatch throws.
         // Restore service if draining or the capacity observation fails before termination.
         draining = true;
@@ -788,15 +788,15 @@ export async function scaleIn(targetServer, options) {
             }
         }
         try {
-            await setMasterStatus(candidateServer._id, 'running');
+            await setPrimaryStatus(candidateServer._id, 'running');
         } catch (stateError) {
-            console.error('[@cocreate/autoscaler] Could not restore master status:', stateError);
+            console.error('[@cocreate/autoscaler] Could not restore primary status:', stateError);
         }
         throw error;
     }
 
     // Commit retirement before provider dispatch so normal State saves preserve it.
-    await setMasterStatus(candidateServer._id, 'terminating');
+    await setPrimaryStatus(candidateServer._id, 'terminating');
     console.log(`[@cocreate/autoscaler] [SCALE-IN] Sending termination request for node [${deploymentId}] through workflow.deleteOrganizationServer.`);
     let response;
     let terminationError;
@@ -830,8 +830,8 @@ export async function scaleIn(targetServer, options) {
         });
     }
 
-    if (terminationError) await setMasterStatus(candidateServer._id, 'failed');
-    server.state.shutdown({ server: candidateServer._id, master: true, organization_id: server.organization_id });
+    if (terminationError) await setPrimaryStatus(candidateServer._id, 'failed');
+    server.state.shutdown({ server: candidateServer._id, primary: true, organization_id: server.organization_id });
     if (terminationError) throw terminationError;
     return response;
 }
@@ -1047,7 +1047,7 @@ function watchStartup(serverId) {
             if (!response || response.error?.length || response.success === false || !Array.isArray(response.object)) throw new Error('Unable to read startup state.');
             const record = response.object.find(record => String(record._id) === serverId);
             const reported = record && (
-                (typeof record.master?.status === 'string' && record.master.status !== 'provisioning') ||
+                (typeof record.primary?.status === 'string' && record.primary.status !== 'provisioning') ||
                 Object.entries(record).some(([key, value]) => /^worker\d+$/.test(key) && typeof value?.status === 'string')
             );
             // TODO: Notify the platform and consider at most one replacement.
@@ -1084,7 +1084,7 @@ export async function init(serverInstance) {
     clearInterval(cleanupTimer);
     cleanupTimer = startServerCleanup(server);
 
-    console.log("[@cocreate/autoscaler] [MASTER] Autoscaler service initialized successfully.");
+    console.log("[@cocreate/autoscaler] [PRIMARY] Autoscaler service initialized successfully.");
 
     return {
         config: autoscaleConfig,
@@ -1103,7 +1103,7 @@ export default {
 };
 
 /**
- * Decentralized, masterless P2P autoscaling engine for CoCreate Server. Executes autonomous horizontal and vertical multi-cloud adjustments driven by real-time tenant telemetry.
+ * Peer-to-peer autoscaling engine for CoCreate Server. Executes autonomous horizontal and vertical multi-cloud adjustments driven by real-time tenant telemetry.
  *
  * @module autoscaler
  * @environment server
